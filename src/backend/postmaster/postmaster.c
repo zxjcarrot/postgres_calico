@@ -587,6 +587,8 @@ PostmasterMain(int argc, char *argv[])
 	 * Options setup
 	 */
 	InitializeGUCOptions();
+    
+    BufferManagerGucInit();
 
 	opterr = 1;
 

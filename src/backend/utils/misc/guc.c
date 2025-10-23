@@ -1514,6 +1514,7 @@ InitializeGUCOptions(void)
 	SetConfigOption("transaction_deferrable", "no",
 					PGC_POSTMASTER, PGC_S_OVERRIDE);
 
+    CalicoGucInit();
 	/*
 	 * For historical reasons, some GUC parameters can receive defaults from
 	 * environment variables.  Process those settings.

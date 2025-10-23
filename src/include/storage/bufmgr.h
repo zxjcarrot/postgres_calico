@@ -420,6 +420,10 @@ BufferGetPage(Buffer buffer)
 	return (Page) BufferGetBlock(buffer);
 }
 
+extern void BufferManagerGucInit(void);
+extern void CalicoGucInit(void);
+extern void BufferManagerStrategySelection(void);
+
 #endif							/* FRONTEND */
 
 #endif							/* BUFMGR_H */

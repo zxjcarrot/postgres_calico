@@ -418,6 +418,75 @@ ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer)
 	ResourceOwnerForget(owner, Int32GetDatum(buffer), &buffer_io_resowner_desc);
 }
 
+struct BufferDesc;
+/* ----------------------------------------------------------------
+ *		Buffer Manager API (Strategy Pattern)
+ *
+ * This structure defines the interface for a buffer pool implementation.
+ * We can switch between the traditional hashtable and the new Calico
+ * implementation by pointing the global ActiveBufMgr to the desired
+ * set of functions.
+ * ----------------------------------------------------------------
+ */
+typedef struct BufferManagerAPI
+{
+	void (*ShmemInit) (void);
+	struct BufferDesc *(*LookupAndPin) (SMgrRelation smgr,
+									   char relpersistence,
+									   ForkNumber forkNum,
+									   BlockNumber blockNum,
+									   BufferAccessStrategy strategy,
+									   bool *foundPtr);
+	PrefetchBufferResult (*PrefetchBuffer) (SMgrRelation smgr,
+											 ForkNumber forkNum,
+											 BlockNumber blockNum);
+    bool (*InvalidateVictimBuffer)(struct BufferDesc *buf);
+    void (*ForceInvalidateBuffer) (BufferDesc *buf);
+} BufferManagerAPI;
+
+
+/*
+ * And we need to declare the global pointer that holds the active strategy.
+ * The actual definition will be in bufmgr.c.
+ */
+extern PGDLLIMPORT const BufferManagerAPI *ActiveBufMgr;
+
+/* ----------------------------------------------------------------
+ *		API Implementation Function Prototypes
+ *
+ * These functions are the concrete implementations of the BufferManagerAPI
+ * interface. They are defined in hashtable.c and calico.c.
+ * ----------------------------------------------------------------
+ */
+
+/* From hashtable.c */
+extern void HashTableShmemInit(void);
+extern struct BufferDesc *HashTableLookupAndPin(SMgrRelation smgr,
+									   char relpersistence,
+									   ForkNumber forkNum,
+									   BlockNumber blockNum,
+									   BufferAccessStrategy strategy,
+									   bool *foundPtr);
+extern struct PrefetchBufferResult
+HashTablePrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
+
+extern bool HashTableInvalidateVictimBuffer(BufferDesc *buf_hdr);
+extern void HashTableForceInvalidateBuffer(BufferDesc *buf_hdr);
+
+/* From calico.c */
+extern void CalicoShmemInit(void);
+extern struct BufferDesc *CalicoLookupAndPin(SMgrRelation smgr,
+									   char relpersistence,
+									   ForkNumber forkNum,
+									   BlockNumber blockNum,
+									   BufferAccessStrategy strategy,
+									   bool *foundPtr);
+extern struct PrefetchBufferResult
+CalicoPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
+
+extern bool CalicoInvalidateVictimBuffer(BufferDesc *buf_hdr);
+extern void CalicoForceInvalidateBuffer(BufferDesc *buf_hdr);
+
 /*
  * Internal buffer management routines
  */
@@ -483,5 +552,17 @@ extern void DropRelationLocalBuffers(RelFileLocator rlocator,
 									 BlockNumber *firstDelBlock);
 extern void DropRelationAllLocalBuffers(RelFileLocator rlocator);
 extern void AtEOXact_LocalBuffers(bool isCommit);
+
+/*
+ * Public buffer management helper functions (from bufmgr.c)
+ */
+extern Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+extern bool PinBuffer(BufferDesc *desc, BufferAccessStrategy strategy, bool is_new);
+extern void UnpinBuffer(BufferDesc *desc);
+extern void ReservePrivateRefCountEntry(void);
+
+extern int32 GetPrivateRefCount(Buffer buffer);
+extern inline int32 GetPrivateRefCount(Buffer buffer);
+
 
 #endif							/* BUFMGR_INTERNALS_H */
