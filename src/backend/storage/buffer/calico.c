@@ -90,7 +90,12 @@ calico_shmem_request_hook(void)
     if (requested || calico_second_level_total_size_mb <= 0)
         return;
 
+    /* Request space for second-level tables */
     RequestAddinShmemSpace((Size)calico_second_level_total_size_mb * 1024L * 1024L);
+    
+    /* Request space for dedicated partition locks */
+    RequestAddinShmemSpace((Size)NUM_BUFFER_PARTITIONS * sizeof(LWLockPadded));
+    
     requested = true;
 }
 
@@ -130,16 +135,23 @@ static HTAB              *CalicoRelMap;
 static pg_atomic_uint32  *CalicoNextRelationID;
 
 /*
- * We reuse the same lwlock partitioning machinery as buffer mapping for
- * the *relation-id map* itself; that's fine because it's an independent
- * data structure. BUT for per-(rel,block) directory ops we ALWAYS use
- * BufTableHashCode(tag) + BufMappingPartitionLock(newHash).
+ * Separate LWLock array for Calico buffer mapping partitions.
+ * This is independent from MainLWLockArray and provides dedicated locks
+ * for the Calico directory operations.
+ */
+static LWLockPadded *CalicoPartitionLocks = NULL;
+
+#define NUM_CALICO_PARTITIONS NUM_BUFFER_PARTITIONS
+
+/*
+ * BufMappingPartitionLock2 returns a partition lock from the Calico-specific
+ * lock array. The partitioning logic mirrors the original buffer mapping
+ * to maintain equivalent concurrency semantics.
  */
 static inline LWLock *
 BufMappingPartitionLock2(uint32 hashcode)
 {
-    return &MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET +
-                            BufTableHashPartition(hashcode)].lock;
+    return &CalicoPartitionLocks[BufTableHashPartition(hashcode)].lock;
 }
 
 /* -------------------------------------------------------------------------
@@ -187,6 +199,18 @@ CalicoShmemInit(void)
         /* Initialize all slots atomically to 0 */
         for (uint32 i = 0; i < MAX_RELATION_IDS; i++)
             pg_atomic_init_u64(&CalicoTopLevelTable[i], 0);
+    }
+
+    /* 4) Dedicated partition locks for Calico directory operations */
+    CalicoPartitionLocks = (LWLockPadded *)
+        ShmemInitStruct("Calico Partition Locks",
+                        NUM_CALICO_PARTITIONS * sizeof(LWLockPadded),
+                        &found);
+    if (!found)
+    {
+        /* Initialize all partition locks with LWTRANCHE_BUFFER_MAPPING tranche */
+        for (uint32 i = 0; i < NUM_CALICO_PARTITIONS; i++)
+            LWLockInitialize(&CalicoPartitionLocks[i].lock, LWTRANCHE_BUFFER_MAPPING);
     }
 
     /*
@@ -371,8 +395,8 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
             if (!found_shmem)
             {
                 /* atomic initialize all entries to 0 */
-                for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
-                    pg_atomic_init_u64(&new_tab[i], 0);
+                // for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
+                //     pg_atomic_init_u64(&new_tab[i], 0);
             }
 
             uint64 expected = 0;
@@ -383,6 +407,7 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
                 new_tab = (SecondLevelTable)(uintptr_t) expected;
             }
             second_level_table = new_tab;
+            fprintf(stderr, "Created Calico L2 table for %s of size %zu\n", name, sizeof(CalicoTranslationEntry) * MAX_BLOCKS_PER_REL);
         }
         else
             second_level_table = (SecondLevelTable)(uintptr_t)p;

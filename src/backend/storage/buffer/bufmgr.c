@@ -1545,7 +1545,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			bool *foundPtr, IOContext io_context)
 {
 	return ActiveBufMgr->LookupAndPin(smgr, relpersistence, forkNum, blockNum,
-									  strategy, foundPtr, IOContext io_context);
+									  strategy, foundPtr, io_context);
 }
 
 /*
