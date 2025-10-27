@@ -423,7 +423,7 @@ struct BufferDesc;
 typedef struct BufferManagerAPI
 {
 	void (*ShmemInit) (void);
-	struct BufferDesc *(*LookupAndPin) (SMgrRelation smgr,
+	BufferDesc *(*LookupAndPin) (SMgrRelation smgr,
 									   char relpersistence,
 									   ForkNumber forkNum,
 									   BlockNumber blockNum,
@@ -432,8 +432,20 @@ typedef struct BufferManagerAPI
 	PrefetchBufferResult (*PrefetchBuffer) (SMgrRelation smgr,
 											 ForkNumber forkNum,
 											 BlockNumber blockNum);
-    bool (*InvalidateVictimBuffer)(struct BufferDesc *buf);
-    void (*ForceInvalidateBuffer) (BufferDesc *buf);
+	bool (*InvalidateVictimBuffer)(BufferDesc *buf);
+	void (*ForceInvalidateBuffer) (BufferDesc *buf);
+	
+	/* Optimistic read interfaces */
+	BufferDesc *(*LookupAndOptimisticPin) (SMgrRelation smgr,
+										   ForkNumber forkNum,
+										   BlockNumber blockNum,
+										   bool *foundPtr,
+										   uint64 *versionOut,
+										   uint32 *frameIdOut);
+	bool (*LookupAndOptimisticValidate) (SMgrRelation smgr,
+										 ForkNumber forkNum,
+										 BlockNumber blockNum,
+										 uint64 expectedVersion);
 } BufferManagerAPI;
 
 
@@ -453,33 +465,53 @@ extern PGDLLIMPORT const BufferManagerAPI *ActiveBufMgr;
 
 /* From hashtable.c */
 extern void HashTableShmemInit(void);
-extern struct BufferDesc *HashTableLookupAndPin(SMgrRelation smgr,
+extern BufferDesc *HashTableLookupAndPin(SMgrRelation smgr,
 									   char relpersistence,
 									   ForkNumber forkNum,
 									   BlockNumber blockNum,
 									   BufferAccessStrategy strategy,
 									   bool *foundPtr, IOContext io_context);
-extern struct PrefetchBufferResult
+extern PrefetchBufferResult
 HashTablePrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
 
 extern bool HashTableInvalidateVictimBuffer(BufferDesc *buf_hdr);
 extern void HashTableForceInvalidateBuffer(BufferDesc *buf_hdr);
 
+extern BufferDesc *HashTableLookupAndOptimisticPin(SMgrRelation smgr,
+												   ForkNumber forkNum,
+												   BlockNumber blockNum,
+												   bool *foundPtr,
+												   uint64 *versionOut,
+												   uint32 *frameIdOut);
+extern bool HashTableLookupAndOptimisticValidate(SMgrRelation smgr,
+												 ForkNumber forkNum,
+												 BlockNumber blockNum,
+												 uint64 expectedVersion);
+
 /* From calico.c */
 extern void CalicoShmemInit(void);
-extern struct BufferDesc *CalicoLookupAndPin(SMgrRelation smgr,
+extern BufferDesc *CalicoLookupAndPin(SMgrRelation smgr,
 									   char relpersistence,
 									   ForkNumber forkNum,
 									   BlockNumber blockNum,
 									   BufferAccessStrategy strategy,
 									   bool *foundPtr, IOContext io_context);
-extern struct PrefetchBufferResult
+extern PrefetchBufferResult
 CalicoPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
 
 extern bool CalicoInvalidateVictimBuffer(BufferDesc *buf_hdr);
 extern void CalicoForceInvalidateBuffer(BufferDesc *buf_hdr);
 
-/*
+extern BufferDesc *CalicoLookupAndOptimisticPin(SMgrRelation smgr,
+												ForkNumber forkNum,
+												BlockNumber blockNum,
+												bool *foundPtr,
+												uint64 *versionOut,
+												uint32 *frameIdOut);
+extern bool CalicoLookupAndOptimisticValidate(SMgrRelation smgr,
+											   ForkNumber forkNum,
+											   BlockNumber blockNum,
+											   uint64 expectedVersion);/*
  * Internal buffer management routines
  */
 /* bufmgr.c */

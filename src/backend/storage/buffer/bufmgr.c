@@ -5774,21 +5774,28 @@ EvictUnpinnedBuffer(Buffer buf)
 // Add a new GUC parameter to select the buffer manager implementation.
 char *buffer_manager_api_string = "hashtable";
 
+// GUC parameter to enable optimistic reads for buffer pool lookups
+bool enable_optimistic_buffer_reads = false;
+
 // Forward declarations for our two implementations
 static const BufferManagerAPI HashTableApi = {
 	.ShmemInit = HashTableShmemInit,
 	.LookupAndPin = HashTableLookupAndPin,
 	.PrefetchBuffer = HashTablePrefetchBuffer,
-    .InvalidateVictimBuffer = HashTableInvalidateVictimBuffer,
-    .ForceInvalidateBuffer = HashTableForceInvalidateBuffer
+	.InvalidateVictimBuffer = HashTableInvalidateVictimBuffer,
+	.ForceInvalidateBuffer = HashTableForceInvalidateBuffer,
+	.LookupAndOptimisticPin = HashTableLookupAndOptimisticPin,
+	.LookupAndOptimisticValidate = HashTableLookupAndOptimisticValidate
 };
 
 static const BufferManagerAPI CalicoApi = {
 	.ShmemInit = CalicoShmemInit,
 	.LookupAndPin = CalicoLookupAndPin,
 	.PrefetchBuffer = CalicoPrefetchBuffer,
-    .InvalidateVictimBuffer = CalicoInvalidateVictimBuffer,
-    .ForceInvalidateBuffer = CalicoForceInvalidateBuffer
+	.InvalidateVictimBuffer = CalicoInvalidateVictimBuffer,
+	.ForceInvalidateBuffer = CalicoForceInvalidateBuffer,
+	.LookupAndOptimisticPin = CalicoLookupAndOptimisticPin,
+	.LookupAndOptimisticValidate = CalicoLookupAndOptimisticValidate
 };
 
 // The active buffer manager implementation
@@ -5805,6 +5812,16 @@ BufferManagerGucInit(void)
 							   PGC_SIGHUP,
 							   0,
 							   NULL, NULL, NULL);
+	
+	DefineCustomBoolVariable("custom.enable_optimistic_buffer_reads",
+							 "Enables optimistic read optimization for buffer pool lookups.",
+							 "This optimization uses version numbers to avoid locking during read operations. "
+							 "Only effective with Calico buffer manager.",
+							 &enable_optimistic_buffer_reads,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 }
 
 void BufferManagerStrategySelection(void)

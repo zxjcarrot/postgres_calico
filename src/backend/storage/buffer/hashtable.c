@@ -424,3 +424,38 @@ retry:
 	 */
 	StrategyFreeBuffer(buf);
 }
+
+/*
+ * HashTableLookupAndOptimisticPin - Blank implementation for hashtable
+ * 
+ * The hashtable implementation doesn't support optimistic reads
+ * because it doesn't maintain version numbers. Always returns NULL
+ * to indicate optimistic read is not supported.
+ */
+BufferDesc *
+HashTableLookupAndOptimisticPin(SMgrRelation smgr,
+                                 ForkNumber forkNum,
+                                 BlockNumber blockNum,
+                                 bool *foundPtr,
+                                 uint64 *versionOut,
+                                 uint32 *frameIdOut)
+{
+	*foundPtr = false;
+	*versionOut = 0;
+	*frameIdOut = 0;
+	return NULL;
+}
+
+/*
+ * HashTableLookupAndOptimisticValidate - Blank implementation for hashtable
+ * 
+ * Always returns false since hashtable doesn't support optimistic reads.
+ */
+bool
+HashTableLookupAndOptimisticValidate(SMgrRelation smgr,
+                                      ForkNumber forkNum,
+                                      BlockNumber blockNum,
+                                      uint64 expectedVersion)
+{
+	return false;
+}

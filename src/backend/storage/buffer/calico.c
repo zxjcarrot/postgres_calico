@@ -39,7 +39,7 @@
 
 /* For IOContext / strategies / smgrprefetch */
 #include "storage/smgr.h"
-
+#include <sys/mman.h>
 /* -------------------------------------------------------------------------
  *                    Calico: Two-Level Indirection Directory
  * ------------------------------------------------------------------------- */
@@ -197,8 +197,12 @@ CalicoShmemInit(void)
     if (!found)
     {
         /* Initialize all slots atomically to 0 */
-        for (uint32 i = 0; i < MAX_RELATION_IDS; i++)
-            pg_atomic_init_u64(&CalicoTopLevelTable[i], 0);
+        // for (uint32 i = 0; i < MAX_RELATION_IDS; i++)
+        //     pg_atomic_init_u64(&CalicoTopLevelTable[i], 0);
+        // madvise huge page
+        madvise(CalicoTopLevelTable,
+                 MAX_RELATION_IDS * sizeof(pg_atomic_uint64),
+                 MADV_HUGEPAGE);
     }
 
     /* 4) Dedicated partition locks for Calico directory operations */
@@ -380,36 +384,48 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
     /* fetch/create second-level table pointer */
     SecondLevelTable second_level_table;
+    bool found_shmem;
+    char name[64];
+    SecondLevelTable new_tab;
+    uint64 expected;
+    uint64 desired;
+    uint64 p;
+    
+    p = pg_atomic_read_u64(&CalicoTopLevelTable[relation_id]);
+    if (unlikely(p == 0))
     {
-        uint64 p = pg_atomic_read_u64(&CalicoTopLevelTable[relation_id]);
-        if (unlikely(p == 0))
+        snprintf(name, sizeof(name), "Calico 2nd-Level Table %u", relation_id);
+
+        new_tab = (SecondLevelTable)
+            ShmemInitStruct(name,
+                            (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
+                            &found_shmem);
+        if (!found_shmem)
         {
-            bool found_shmem;
-            char name[64];
-            snprintf(name, sizeof(name), "Calico 2nd-Level Table %u", relation_id);
-
-            SecondLevelTable new_tab = (SecondLevelTable)
-                ShmemInitStruct(name,
-                                (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
-                                &found_shmem);
-            if (!found_shmem)
-            {
-                /* atomic initialize all entries to 0 */
-                // for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
-                //     pg_atomic_init_u64(&new_tab[i], 0);
-            }
-
-            uint64 expected = 0;
-            uint64 desired  = (uint64)(uintptr_t)new_tab;
-            if (!pg_atomic_compare_exchange_u64(&CalicoTopLevelTable[relation_id], &expected, desired))
-            {
-                /* someone else installed it */
-                new_tab = (SecondLevelTable)(uintptr_t) expected;
-            }
-            second_level_table = new_tab;
-            fprintf(stderr, "Created Calico L2 table for %s of size %zu\n", name, sizeof(CalicoTranslationEntry) * MAX_BLOCKS_PER_REL);
+            /* atomic initialize all entries to 0 */
+            // for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
+            //     pg_atomic_init_u64(&new_tab[i], 0);
+            //madvise huge page
+            madvise(new_tab,
+                     (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
+                     MADV_HUGEPAGE);
         }
-            second_level_table = (SecondLevelTable)(uintptr_t)p;
+
+        expected = 0;
+        desired  = (uint64)(uintptr_t)new_tab;
+        if (!pg_atomic_compare_exchange_u64(&CalicoTopLevelTable[relation_id], &expected, desired))
+        {
+            /* someone else installed it */
+            new_tab = (SecondLevelTable)(uintptr_t) expected;
+        }
+        second_level_table = new_tab;
+        fprintf(stderr, "Created Calico L2 table for %s of size %zu\n", name, sizeof(CalicoTranslationEntry) * MAX_BLOCKS_PER_REL);
+    }
+    else
+    {
+        second_level_table = (SecondLevelTable)(uintptr_t)p;
+    }
+    
     CalicoTranslationEntry *entry_ptr = &second_level_table[blockNum];
 
     /* Build the canonical BufferTag and choose the SAME mapping partition lock as hashtable */
@@ -768,64 +784,78 @@ CalicoMap_TagToRidBlk(const BufferTag *tag, uint32 *out_rid, uint32 *out_blk)
 int
 CalicoShim_BufTableLookup(const BufferTag *tag, uint32 hashcode)
 {
-
     uint32 rid, blk;
+    SecondLevelTable second;
+    CalicoTranslationEntry *entry_ptr;
+    uint64 p;
+    uint64 v;
+    int ret;
+    
     if (!CalicoMap_TagToRidBlk(tag, &rid, &blk))
         return -1;
 
-    uint64 p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
+    p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
     if (p == 0)
         return -1;
 
-    SecondLevelTable second = (SecondLevelTable)(uintptr_t)p;
-    CalicoTranslationEntry *entry_ptr = &second[blk];
-    uint64 v = pg_atomic_read_u64(entry_ptr);
-    int ret = (CalicoGetState(v) == CALICO_STATE_VALID) ? (int)CalicoGetFrameId(v) : -1;
+    second = (SecondLevelTable)(uintptr_t)p;
+    entry_ptr = &second[blk];
+    v = pg_atomic_read_u64(entry_ptr);
+    ret = (CalicoGetState(v) == CALICO_STATE_VALID) ? (int)CalicoGetFrameId(v) : -1;
     return ret;
 }
 
 int
 CalicoShim_BufTableInsert(const BufferTag *tag, uint32 hashcode, int buf_id)
 {
-    uint32 rid = CalicoGetRelationID(tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum);
-
+    uint32 rid;
     SecondLevelTable second;
+    bool found_shmem;
+    char name[64];
+    SecondLevelTable new_tab;
+    uint64 p;
+    uint64 expected;
+    uint64 desired;
+    uint32 blk;
+    CalicoTranslationEntry *entry_ptr;
+    uint64 cur;
+    uint32 i;
+    
+    rid = CalicoGetRelationID(tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum);
+
+    p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
+    if (p == 0)
     {
-        uint64 p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
-        if (p == 0)
+        snprintf(name, sizeof(name), "Calico 2nd-Level Table %u", rid);
+        new_tab = (SecondLevelTable)
+            ShmemInitStruct(name,
+                            (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
+                            &found_shmem);
+        if (!found_shmem)
         {
-            bool found_shmem;
-            char name[64];
-            snprintf(name, sizeof(name), "Calico 2nd-Level Table %u", rid);
-            SecondLevelTable new_tab = (SecondLevelTable)
-                ShmemInitStruct(name,
-                                (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
-                                &found_shmem);
-            if (!found_shmem)
-            {
-                for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
-                    pg_atomic_init_u64(&new_tab[i], 0);
-            }
-            uint64 expected = 0, desired = (uint64)(uintptr_t)new_tab;
-            if (!pg_atomic_compare_exchange_u64(&CalicoTopLevelTable[rid], &expected, desired))
-                new_tab = (SecondLevelTable)(uintptr_t) expected;
-            second = new_tab;
+            for (i = 0; i < MAX_BLOCKS_PER_REL; i++)
+                pg_atomic_init_u64(&new_tab[i], 0);
         }
-        else
-            second = (SecondLevelTable)(uintptr_t)p;
+        expected = 0;
+        desired = (uint64)(uintptr_t)new_tab;
+        if (!pg_atomic_compare_exchange_u64(&CalicoTopLevelTable[rid], &expected, desired))
+            new_tab = (SecondLevelTable)(uintptr_t) expected;
+        second = new_tab;
     }
+    else
+        second = (SecondLevelTable)(uintptr_t)p;
 
-    uint32 blk = tag->blockNum;
-    CalicoTranslationEntry *entry_ptr = &second[blk];
+    blk = tag->blockNum;
+    entry_ptr = &second[blk];
 
-    uint64 cur = pg_atomic_read_u64(entry_ptr);
+    cur = pg_atomic_read_u64(entry_ptr);
     if (CalicoGetState(cur) == CALICO_STATE_VALID)
     {
         int existing = (int) CalicoGetFrameId(cur);
         return existing;
     }
 
-    uint64 desired = CalicoPackEntry((uint32)buf_id, CalicoGetVersion(cur)+1, CALICO_STATE_VALID);
+    desired = CalicoPackEntry((uint32)buf_id, CalicoGetVersion(cur)+1, CALICO_STATE_VALID);
     if (!pg_atomic_compare_exchange_u64(entry_ptr, &cur, desired))
     {
         int existing = (int) CalicoGetFrameId(pg_atomic_read_u64(entry_ptr));
@@ -839,20 +869,144 @@ void
 CalicoShim_BufTableDelete(const BufferTag *tag, uint32 hashcode)
 {
     uint32 rid, blk;
+    uint64 p;
+    SecondLevelTable second;
+    CalicoTranslationEntry *entry_ptr;
+    uint64 cur;
+    uint64 desired;
+    
     if (!CalicoMap_TagToRidBlk(tag, &rid, &blk))
         return;
 
-    uint64 p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
+    p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
     if (p == 0)
         return;
 
-    SecondLevelTable second = (SecondLevelTable)(uintptr_t)p;
-    CalicoTranslationEntry *entry_ptr = &second[blk];
+    second = (SecondLevelTable)(uintptr_t)p;
+    entry_ptr = &second[blk];
 
-    uint64 cur = pg_atomic_read_u64(entry_ptr);
+    cur = pg_atomic_read_u64(entry_ptr);
     if (CalicoGetState(cur) == CALICO_STATE_VALID)
     {
-        uint64 desired = CalicoPackEntry(0, CalicoGetVersion(cur)+1, CALICO_STATE_EVICTED);
+        desired = CalicoPackEntry(0, CalicoGetVersion(cur)+1, CALICO_STATE_EVICTED);
         (void) pg_atomic_compare_exchange_u64(entry_ptr, &cur, desired);
     }
+}
+
+/* -------------------------------------------------------------------------
+ *                    Optimistic Read Interfaces
+ * ------------------------------------------------------------------------- */
+
+/*
+ * CalicoLookupAndOptimisticPin - Lookup a buffer without taking locks
+ * 
+ * This function performs an optimistic read of the buffer mapping:
+ * 1. Reads the version number from the translation entry
+ * 2. Returns the frame ID (buf_id) directly to avoid BufferDesc dereference
+ * 3. Caller must validate using CalicoLookupAndOptimisticValidate
+ * 
+ * Returns NULL if the page is not in the buffer pool
+ */
+BufferDesc *
+CalicoLookupAndOptimisticPin(SMgrRelation smgr,
+                              ForkNumber forkNum,
+                              BlockNumber blockNum,
+                              bool *foundPtr,
+                              uint64 *versionOut,
+                              uint32 *frameIdOut)
+{
+    const RelFileLocator *rlocator = &smgr->smgr_rlocator.locator;
+    BufferTag tag;
+    uint32 rid;
+    uint64 p;
+    SecondLevelTable second;
+    CalicoTranslationEntry *entry_ptr;
+    uint64 entry_val;
+    uint32 buf_id;
+    BufferDesc *buf;
+    
+    *foundPtr = false;
+    *versionOut = 0;
+    *frameIdOut = 0;
+    
+    if (unlikely(blockNum >= MAX_BLOCKS_PER_REL))
+        return NULL;
+    
+    /* Build the BufferTag */
+    InitBufferTag(&tag, rlocator, forkNum, blockNum);
+    
+    // use CalicoGetRelationID
+    rid = CalicoGetRelationID(rlocator->spcOid, rlocator->dbOid,
+                                             rlocator->relNumber, forkNum);
+
+    /* Get second-level table */
+    p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
+    if (p == 0)
+        return NULL;
+    
+    second = (SecondLevelTable)(uintptr_t)p;
+    entry_ptr = &second[blockNum];
+    
+    /* Read entry atomically */
+    entry_val = pg_atomic_read_u64(entry_ptr);
+    
+    /* Check if entry is valid */
+    if (CalicoGetState(entry_val) != CALICO_STATE_VALID)
+        return NULL;
+    
+    buf_id = CalicoGetFrameId(entry_val);
+    buf = GetBufferDescriptor(buf_id);
+    
+    /* Return the version number and frame ID for later validation */
+    *versionOut = entry_val;
+    *frameIdOut = buf_id;
+    *foundPtr = true;
+    
+    return buf;
+}
+
+/*
+ * CalicoLookupAndOptimisticValidate - Validate an optimistic read
+ * 
+ * Checks if the version number in the translation entry has changed
+ * since the optimistic read. Returns true if the data is still valid.
+ */
+bool
+CalicoLookupAndOptimisticValidate(SMgrRelation smgr,
+                                   ForkNumber forkNum,
+                                   BlockNumber blockNum,
+                                   uint64 expectedVersion)
+{
+    const RelFileLocator *rlocator = &smgr->smgr_rlocator.locator;
+    BufferTag tag;
+    uint32 rid;
+    uint64 p;
+    SecondLevelTable second;
+    CalicoTranslationEntry *entry_ptr;
+    uint64 current_val;
+    
+    if (unlikely(blockNum >= MAX_BLOCKS_PER_REL))
+        return false;
+    
+    /* Build the BufferTag */
+    InitBufferTag(&tag, rlocator, forkNum, blockNum);
+    
+    // use CalicoGetRelationID
+    rid = CalicoGetRelationID(rlocator->spcOid, rlocator->dbOid,
+                              rlocator->relNumber, forkNum);
+
+    
+    /* Get second-level table */
+    p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
+    if (p == 0)
+        return false;
+    
+    second = (SecondLevelTable)(uintptr_t)p;
+    entry_ptr = &second[blockNum];
+    
+    /* Read current entry value */
+    current_val = pg_atomic_read_u64(entry_ptr);
+    
+    /* Compare with expected version - exact match required */
+    return (current_val == expectedVersion);
 }
