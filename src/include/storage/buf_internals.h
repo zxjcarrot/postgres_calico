@@ -441,11 +441,23 @@ typedef struct BufferManagerAPI
 										   BlockNumber blockNum,
 										   bool *foundPtr,
 										   uint64 *versionOut,
-										   uint32 *frameIdOut);
-	bool (*LookupAndOptimisticValidate) (SMgrRelation smgr,
-										 ForkNumber forkNum,
-										 BlockNumber blockNum,
+										   uint32 *frameIdOut,
+										   void **entryPtrOut);
+	bool (*LookupAndOptimisticValidate) (void *entryPtr,
 										 uint64 expectedVersion);
+	
+	/* Batch version of LookupAndOptimisticPin for improved ILP/MLP */
+	void (*LookupAndOptimisticPinBatch) (SMgrRelation smgr,
+										 ForkNumber forkNum,
+										 const BlockNumber *blockNums,
+										 int count,
+										 uint32 *frameIdsOut,
+										 bool *foundOut);
+	
+	/* Get relation ID for a given SMgrRelation to reuse across multiple lookups */
+	bool (*GetRelationID) (SMgrRelation smgr,
+						   ForkNumber forkNum,
+						   uint32 *relationIdOut);
 } BufferManagerAPI;
 
 
@@ -482,11 +494,19 @@ extern BufferDesc *HashTableLookupAndOptimisticPin(SMgrRelation smgr,
 												   BlockNumber blockNum,
 												   bool *foundPtr,
 												   uint64 *versionOut,
-												   uint32 *frameIdOut);
-extern bool HashTableLookupAndOptimisticValidate(SMgrRelation smgr,
-												 ForkNumber forkNum,
-												 BlockNumber blockNum,
+												   uint32 *frameIdOut,
+												   void **entryPtrOut);
+extern bool HashTableLookupAndOptimisticValidate(void *entryPtr,
 												 uint64 expectedVersion);
+extern void HashTableLookupAndOptimisticPinBatch(SMgrRelation smgr,
+												 ForkNumber forkNum,
+												 const BlockNumber *blockNums,
+												 int count,
+												 uint32 *frameIdsOut,
+												 bool *foundOut);
+extern bool HashTableGetRelationID(SMgrRelation smgr,
+								   ForkNumber forkNum,
+								   uint32 *relationIdOut);
 
 /* From calico.c */
 extern void CalicoShmemInit(void);
@@ -503,15 +523,33 @@ extern bool CalicoInvalidateVictimBuffer(BufferDesc *buf_hdr);
 extern void CalicoForceInvalidateBuffer(BufferDesc *buf_hdr);
 
 extern BufferDesc *CalicoLookupAndOptimisticPin(SMgrRelation smgr,
-												ForkNumber forkNum,
-												BlockNumber blockNum,
-												bool *foundPtr,
-												uint64 *versionOut,
-												uint32 *frameIdOut);
-extern bool CalicoLookupAndOptimisticValidate(SMgrRelation smgr,
-											   ForkNumber forkNum,
-											   BlockNumber blockNum,
-											   uint64 expectedVersion);/*
+											ForkNumber forkNum,
+											BlockNumber blockNum,
+											bool *foundPtr,
+											uint64 *versionOut,
+											uint32 *frameIdOut,
+											void **entryPtrOut);
+extern bool CalicoLookupAndOptimisticValidate(void *entryPtr,
+										   uint64 expectedVersion);
+extern void CalicoLookupAndOptimisticPinBatch(SMgrRelation smgr,
+											  ForkNumber forkNum,
+											  const BlockNumber *blockNums,
+											  int count,
+											  uint32 *frameIdsOut,
+											  bool *foundOut);
+extern bool CalicoGetRelationID(SMgrRelation smgr,
+								ForkNumber forkNum,
+								uint32 *relationIdOut);
+extern BufferDesc *CalicoLookupAndOptimisticPinWithRid(SMgrRelation smgr,
+													   ForkNumber forkNum,
+													   BlockNumber blockNum,
+													   bool *foundPtr,
+													   uint64 *versionOut,
+													   uint32 *frameIdOut,
+													   void **entryPtrOut,
+													   uint32 relation_id);
+
+/*
  * Internal buffer management routines
  */
 /* bufmgr.c */

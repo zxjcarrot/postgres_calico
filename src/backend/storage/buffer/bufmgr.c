@@ -5785,7 +5785,9 @@ static const BufferManagerAPI HashTableApi = {
 	.InvalidateVictimBuffer = HashTableInvalidateVictimBuffer,
 	.ForceInvalidateBuffer = HashTableForceInvalidateBuffer,
 	.LookupAndOptimisticPin = HashTableLookupAndOptimisticPin,
-	.LookupAndOptimisticValidate = HashTableLookupAndOptimisticValidate
+	.LookupAndOptimisticValidate = HashTableLookupAndOptimisticValidate,
+	.LookupAndOptimisticPinBatch = HashTableLookupAndOptimisticPinBatch,
+	.GetRelationID = NULL
 };
 
 static const BufferManagerAPI CalicoApi = {
@@ -5795,7 +5797,9 @@ static const BufferManagerAPI CalicoApi = {
 	.InvalidateVictimBuffer = CalicoInvalidateVictimBuffer,
 	.ForceInvalidateBuffer = CalicoForceInvalidateBuffer,
 	.LookupAndOptimisticPin = CalicoLookupAndOptimisticPin,
-	.LookupAndOptimisticValidate = CalicoLookupAndOptimisticValidate
+	.LookupAndOptimisticValidate = CalicoLookupAndOptimisticValidate,
+	.LookupAndOptimisticPinBatch = CalicoLookupAndOptimisticPinBatch,
+	.GetRelationID = CalicoGetRelationID
 };
 
 // The active buffer manager implementation

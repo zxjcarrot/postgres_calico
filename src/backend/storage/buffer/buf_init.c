@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include <sys/mman.h>
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
@@ -84,6 +85,16 @@ InitBufferPool(void)
 				  ShmemInitStruct("Buffer Blocks",
 								  NBuffers * (Size) BLCKSZ + PG_IO_ALIGN_SIZE,
 								  &foundBufs));
+	// madvise huge page
+	if (!foundBufs)
+	{
+		size_t		bufsz = NBuffers * (Size) BLCKSZ;
+		void	   *aligned_buf;
+
+		aligned_buf = (void *) TYPEALIGN(PG_IO_ALIGN_SIZE, BufferBlocks);
+		if (madvise(aligned_buf, bufsz, MADV_HUGEPAGE) != 0)
+			elog(WARNING, "madvise for huge pages failed: %m");
+	}
 
 	/* Align condition variables to cacheline boundary. */
 	BufferIOCVArray = (ConditionVariableMinimallyPadded *)

@@ -438,11 +438,13 @@ HashTableLookupAndOptimisticPin(SMgrRelation smgr,
                                  BlockNumber blockNum,
                                  bool *foundPtr,
                                  uint64 *versionOut,
-                                 uint32 *frameIdOut)
+                                 uint32 *frameIdOut,
+                                 void **entryPtrOut)
 {
 	*foundPtr = false;
 	*versionOut = 0;
 	*frameIdOut = 0;
+	*entryPtrOut = NULL;
 	return NULL;
 }
 
@@ -452,10 +454,46 @@ HashTableLookupAndOptimisticPin(SMgrRelation smgr,
  * Always returns false since hashtable doesn't support optimistic reads.
  */
 bool
-HashTableLookupAndOptimisticValidate(SMgrRelation smgr,
-                                      ForkNumber forkNum,
-                                      BlockNumber blockNum,
+HashTableLookupAndOptimisticValidate(void *entryPtr,
                                       uint64 expectedVersion)
+{
+	return false;
+}
+
+/*
+ * HashTableLookupAndOptimisticPinBatch - Blank implementation for hashtable
+ * 
+ * Always initializes outputs to not found since hashtable doesn't support
+ * optimistic reads. This is a no-op stub for compatibility with the batch
+ * interface used by Calico.
+ */
+void
+HashTableLookupAndOptimisticPinBatch(SMgrRelation smgr,
+									  ForkNumber forkNum,
+									  const BlockNumber *blockNums,
+									  int count,
+									  uint32 *frameIdsOut,
+									  bool *foundOut)
+{
+	/* Initialize all outputs to indicate not found */
+	for (int i = 0; i < count; i++)
+	{
+		frameIdsOut[i] = 0;
+		foundOut[i] = false;
+	}
+}
+
+/*
+ * HashTableGetRelationID - Stub implementation for hashtable
+ * 
+ * Returns false since hashtable doesn't support relation ID caching.
+ * The traditional hashtable buffer manager doesn't use the Calico
+ * relation ID mapping scheme, so this operation is not supported.
+ */
+bool
+HashTableGetRelationID(SMgrRelation smgr,
+					   ForkNumber forkNum,
+					   uint32 *relationIdOut)
 {
 	return false;
 }
