@@ -109,7 +109,7 @@ typedef CalicoTranslationEntry *SecondLevelTable;
 static pg_atomic_uint64 *CalicoTopLevelTable;
 
 #define MAX_RELATION_IDS        (1U << 20) /* ~1M relation forks */
-#define MAX_BLOCKS_PER_REL      (1U << 24) /* up to 16M blocks per rel-fork */
+#define MAX_BLOCKS_PER_REL      (1U << 22) /* up to 16M blocks per rel-fork */
 
 /* -------------------------------------------------------------------------
  *          Relation-fork → compact RelationID (partitioned hash)
@@ -560,11 +560,8 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
     /* Build the canonical BufferTag and choose the SAME mapping partition lock as hashtable */
     BufferTag tag;
     InitBufferTag(&tag, rlocator, forkNum, blockNum);
-    uint32 newHash = BufTableHashCode(&tag);
-    LWLock *plock = BufMappingPartitionLock(newHash);
 
     /* ------------- HIT PATH ------------- */
-    LWLockAcquire(plock, LW_SHARED);
     uint64 entry_val = pg_atomic_read_u64(entry_ptr);
 
     if (CalicoGetState(entry_val) == CALICO_STATE_VALID)
@@ -580,12 +577,9 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
             {
                 /* mapping changed under us, treat as miss */
                 UnpinBuffer(buf);
-                LWLockRelease(plock);
                 goto miss_path;
             }
         }
-
-        LWLockRelease(plock);
 
         *foundPtr = true;
         if (!valid)
@@ -593,11 +587,12 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
         return buf;
     }
-    LWLockRelease(plock);
 
 miss_path:
     /* ------------- MISS PATH ------------- */
     {
+        uint32 newHash = BufTableHashCode(&tag);
+        LWLock *plock = BufMappingPartitionLock(newHash);
         Buffer victim_buf = GetVictimBuffer(strategy, io_context);
         BufferDesc *victim = GetBufferDescriptor(victim_buf - 1);
 
