@@ -425,6 +425,150 @@ ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer)
 	ResourceOwnerForget(owner, Int32GetDatum(buffer), &buffer_io_resowner_desc);
 }
 
+struct BufferDesc;
+/* ----------------------------------------------------------------
+ *		Buffer Manager API (Strategy Pattern)
+ *
+ * This structure defines the interface for a buffer pool implementation.
+ * We can switch between the traditional hashtable and the new Calico
+ * implementation by pointing the global ActiveBufMgr to the desired
+ * set of functions.
+ * ----------------------------------------------------------------
+ */
+typedef struct BufferManagerAPI
+{
+	void (*ShmemInit) (void);
+	BufferDesc *(*LookupAndPin) (SMgrRelation smgr,
+									   char relpersistence,
+									   ForkNumber forkNum,
+									   BlockNumber blockNum,
+									   BufferAccessStrategy strategy,
+									   bool *foundPtr, IOContext io_context);
+	PrefetchBufferResult (*PrefetchBuffer) (SMgrRelation smgr,
+											 ForkNumber forkNum,
+											 BlockNumber blockNum);
+	bool (*InvalidateVictimBuffer)(BufferDesc *buf);
+	void (*ForceInvalidateBuffer) (BufferDesc *buf);
+	
+	/* Optimistic read interfaces */
+	BufferDesc *(*LookupAndOptimisticPin) (SMgrRelation smgr,
+										   ForkNumber forkNum,
+										   BlockNumber blockNum,
+										   bool *foundPtr,
+										   uint64 *versionOut,
+										   uint32 *frameIdOut,
+										   void **entryPtrOut);
+	bool (*LookupAndOptimisticValidate) (void *entryPtr,
+										 uint64 expectedVersion);
+	
+	/* Batch version of LookupAndOptimisticPin for improved ILP/MLP */
+	void (*LookupAndOptimisticPinBatch) (SMgrRelation smgr,
+										 ForkNumber forkNum,
+										 const BlockNumber *blockNums,
+										 int count,
+										 uint32 *frameIdsOut,
+										 bool *foundOut);
+	
+	/* Get relation ID for a given SMgrRelation to reuse across multiple lookups */
+	bool (*GetRelationID) (SMgrRelation smgr,
+						   ForkNumber forkNum,
+						   uint32 *relationIdOut);
+	
+	/* Set/clear the locked state in the buffer mapping */
+	void (*SetBufferLocked) (BufferDesc *buf, bool locked);
+} BufferManagerAPI;
+
+
+/*
+ * And we need to declare the global pointer that holds the active strategy.
+ * The actual definition will be in bufmgr.c.
+ */
+extern PGDLLIMPORT const BufferManagerAPI *ActiveBufMgr;
+
+/* ----------------------------------------------------------------
+ *		API Implementation Function Prototypes
+ *
+ * These functions are the concrete implementations of the BufferManagerAPI
+ * interface. They are defined in hashtable.c and calico.c.
+ * ----------------------------------------------------------------
+ */
+
+/* From hashtable.c */
+extern void HashTableShmemInit(void);
+extern BufferDesc *HashTableLookupAndPin(SMgrRelation smgr,
+									   char relpersistence,
+									   ForkNumber forkNum,
+									   BlockNumber blockNum,
+									   BufferAccessStrategy strategy,
+									   bool *foundPtr, IOContext io_context);
+extern PrefetchBufferResult
+HashTablePrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
+
+extern bool HashTableInvalidateVictimBuffer(BufferDesc *buf_hdr);
+extern void HashTableForceInvalidateBuffer(BufferDesc *buf_hdr);
+
+extern BufferDesc *HashTableLookupAndOptimisticPin(SMgrRelation smgr,
+												   ForkNumber forkNum,
+												   BlockNumber blockNum,
+												   bool *foundPtr,
+												   uint64 *versionOut,
+												   uint32 *frameIdOut,
+												   void **entryPtrOut);
+extern bool HashTableLookupAndOptimisticValidate(void *entryPtr,
+												 uint64 expectedVersion);
+extern void HashTableLookupAndOptimisticPinBatch(SMgrRelation smgr,
+												 ForkNumber forkNum,
+												 const BlockNumber *blockNums,
+												 int count,
+												 uint32 *frameIdsOut,
+												 bool *foundOut);
+extern bool HashTableGetRelationID(SMgrRelation smgr,
+								   ForkNumber forkNum,
+								   uint32 *relationIdOut);
+extern void HashTableSetBufferLocked(BufferDesc *buf, bool locked);
+
+/* From calico.c */
+extern void CalicoShmemInit(void);
+extern BufferDesc *CalicoLookupAndPin(SMgrRelation smgr,
+									   char relpersistence,
+									   ForkNumber forkNum,
+									   BlockNumber blockNum,
+									   BufferAccessStrategy strategy,
+									   bool *foundPtr, IOContext io_context);
+extern PrefetchBufferResult
+CalicoPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
+
+extern bool CalicoInvalidateVictimBuffer(BufferDesc *buf_hdr);
+extern void CalicoForceInvalidateBuffer(BufferDesc *buf_hdr);
+
+extern BufferDesc *CalicoLookupAndOptimisticPin(SMgrRelation smgr,
+											ForkNumber forkNum,
+											BlockNumber blockNum,
+											bool *foundPtr,
+											uint64 *versionOut,
+											uint32 *frameIdOut,
+											void **entryPtrOut);
+extern bool CalicoLookupAndOptimisticValidate(void *entryPtr,
+										   uint64 expectedVersion);
+extern void CalicoLookupAndOptimisticPinBatch(SMgrRelation smgr,
+											  ForkNumber forkNum,
+											  const BlockNumber *blockNums,
+											  int count,
+											  uint32 *frameIdsOut,
+											  bool *foundOut);
+extern bool CalicoGetRelationID(SMgrRelation smgr,
+								ForkNumber forkNum,
+								uint32 *relationIdOut);
+extern void CalicoSetBufferLocked(BufferDesc *buf, bool locked);
+extern BufferDesc *CalicoLookupAndOptimisticPinWithRid(SMgrRelation smgr,
+													   ForkNumber forkNum,
+													   BlockNumber blockNum,
+													   bool *foundPtr,
+													   uint64 *versionOut,
+													   uint32 *frameIdOut,
+													   void **entryPtrOut,
+													   uint32 relation_id);
+
 /*
  * Internal buffer management routines
  */
@@ -433,6 +577,14 @@ extern void WritebackContextInit(WritebackContext *context, int *max_pending);
 extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
 extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 										  IOContext io_context, BufferTag *tag);
+
+/* Exported helper functions for buffer manager implementations */
+extern void ReservePrivateRefCountEntry(void);
+extern int32 GetPrivateRefCount(Buffer buffer);
+extern bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
+extern void UnpinBuffer(BufferDesc *buf);
+extern Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+extern void WaitIO(BufferDesc *buf);
 
 /* solely to make it easier to write tests */
 extern bool StartBufferIO(BufferDesc *buf, bool forInput, bool nowait);

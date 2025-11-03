@@ -66,6 +66,7 @@
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "utils/guc.h"
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
@@ -145,6 +146,10 @@ bool		zero_damaged_pages = false;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
+bool		enable_optimistic_buffer_reads = false;
+
+/* Buffer Manager Strategy Selection */
+static char *buffer_manager_api_string = NULL;
 
 /*
  * How many buffers PrefetchBuffer callers should try to stay ahead of their
@@ -178,6 +183,44 @@ int			io_max_combine_limit = DEFAULT_IO_COMBINE_LIMIT;
 int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
+
+/*
+ * Buffer Manager API Implementations
+ *
+ * These structures define the two buffer management strategies: the traditional
+ * hashtable-based approach and the new Calico two-level directory approach.
+ */
+static const BufferManagerAPI HashTableAPI = {
+	.ShmemInit = HashTableShmemInit,
+	.LookupAndPin = HashTableLookupAndPin,
+	.PrefetchBuffer = HashTablePrefetchBuffer,
+	.InvalidateVictimBuffer = HashTableInvalidateVictimBuffer,
+	.ForceInvalidateBuffer = HashTableForceInvalidateBuffer,
+	.LookupAndOptimisticPin = HashTableLookupAndOptimisticPin,
+	.LookupAndOptimisticValidate = HashTableLookupAndOptimisticValidate,
+	.LookupAndOptimisticPinBatch = HashTableLookupAndOptimisticPinBatch,
+	.GetRelationID = HashTableGetRelationID,
+	.SetBufferLocked = HashTableSetBufferLocked,
+};
+
+static const BufferManagerAPI CalicoAPI = {
+	.ShmemInit = CalicoShmemInit,
+	.LookupAndPin = CalicoLookupAndPin,
+	.PrefetchBuffer = CalicoPrefetchBuffer,
+	.InvalidateVictimBuffer = CalicoInvalidateVictimBuffer,
+	.ForceInvalidateBuffer = CalicoForceInvalidateBuffer,
+	.LookupAndOptimisticPin = CalicoLookupAndOptimisticPin,
+	.LookupAndOptimisticValidate = CalicoLookupAndOptimisticValidate,
+	.LookupAndOptimisticPinBatch = CalicoLookupAndOptimisticPinBatch,
+	.GetRelationID = CalicoGetRelationID,
+	.SetBufferLocked = CalicoSetBufferLocked,
+};
+
+/*
+ * ActiveBufMgr points to the currently active buffer manager implementation.
+ * It's set during initialization based on the buffer_manager_api GUC.
+ */
+const BufferManagerAPI *ActiveBufMgr = &HashTableAPI;
 
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
@@ -220,10 +263,10 @@ static PrivateRefCountEntry *ReservedRefCountEntry = NULL;
 
 static uint32 MaxProportionalPins;
 
-static void ReservePrivateRefCountEntry(void);
+void ReservePrivateRefCountEntry(void);
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
-static inline int32 GetPrivateRefCount(Buffer buffer);
+inline int32 GetPrivateRefCount(Buffer buffer);
 static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
 
 /* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
@@ -255,7 +298,7 @@ const ResourceOwnerDesc buffer_pin_resowner_desc =
  * entry. This has to be called before using NewPrivateRefCountEntry() to fill
  * a new entry - but it's perfectly fine to not use a reserved entry.
  */
-static void
+void
 ReservePrivateRefCountEntry(void)
 {
 	/* Already reserved (or freed), nothing to do */
@@ -421,7 +464,7 @@ GetPrivateRefCountEntry(Buffer buffer, bool do_move)
  *
  * Only works for shared memory buffers!
  */
-static inline int32
+inline int32
 GetPrivateRefCount(Buffer buffer)
 {
 	PrivateRefCountEntry *ref;
@@ -512,15 +555,15 @@ static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   BlockNumber extend_upto,
 										   Buffer *buffers,
 										   uint32 *extended_by);
-static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
+bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
-static void UnpinBuffer(BufferDesc *buf);
+void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
 static void BufferSync(int flags);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
-static void WaitIO(BufferDesc *buf);
+void WaitIO(BufferDesc *buf);
 static void AbortBufferIO(Buffer buffer);
 static void shared_buffer_write_error_callback(void *arg);
 static void local_buffer_write_error_callback(void *arg);
@@ -532,7 +575,7 @@ static inline BufferDesc *BufferAlloc(SMgrRelation smgr,
 									  bool *foundPtr, IOContext io_context);
 static bool AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress);
 static void CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete);
-static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
@@ -562,65 +605,8 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 					 ForkNumber forkNum,
 					 BlockNumber blockNum)
 {
-	PrefetchBufferResult result = {InvalidBuffer, false};
-	BufferTag	newTag;			/* identity of requested block */
-	uint32		newHash;		/* hash value for newTag */
-	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
-	int			buf_id;
-
-	Assert(BlockNumberIsValid(blockNum));
-
-	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr_reln->smgr_rlocator.locator,
-				  forkNum, blockNum);
-
-	/* determine its hash code and partition lock ID */
-	newHash = BufTableHashCode(&newTag);
-	newPartitionLock = BufMappingPartitionLock(newHash);
-
-	/* see if the block is in the buffer pool already */
-	LWLockAcquire(newPartitionLock, LW_SHARED);
-	buf_id = BufTableLookup(&newTag, newHash);
-	LWLockRelease(newPartitionLock);
-
-	/* If not in buffers, initiate prefetch */
-	if (buf_id < 0)
-	{
-#ifdef USE_PREFETCH
-		/*
-		 * Try to initiate an asynchronous read.  This returns false in
-		 * recovery if the relation file doesn't exist.
-		 */
-		if ((io_direct_flags & IO_DIRECT_DATA) == 0 &&
-			smgrprefetch(smgr_reln, forkNum, blockNum, 1))
-		{
-			result.initiated_io = true;
-		}
-#endif							/* USE_PREFETCH */
-	}
-	else
-	{
-		/*
-		 * Report the buffer it was in at that time.  The caller may be able
-		 * to avoid a buffer table lookup, but it's not pinned and it must be
-		 * rechecked!
-		 */
-		result.recent_buffer = buf_id + 1;
-	}
-
-	/*
-	 * If the block *is* in buffers, we do nothing.  This is not really ideal:
-	 * the block might be just about to be evicted, which would be stupid
-	 * since we know we are going to need it soon.  But the only easy answer
-	 * is to bump the usage_count, which does not seem like a great solution:
-	 * when the caller does ultimately touch the block, usage_count would get
-	 * bumped again, resulting in too much favoritism for blocks that are
-	 * involved in a prefetch sequence. A real fix would involve some
-	 * additional per-buffer state, and it's not clear that there's enough of
-	 * a problem to justify that.
-	 */
-
-	return result;
+	/* Delegate to the active buffer manager strategy */
+	return ActiveBufMgr->PrefetchBuffer(smgr_reln, forkNum, blockNum);
 }
 
 /*
@@ -668,6 +654,156 @@ PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
 	{
 		/* pass it to the shared buffer version */
 		return PrefetchSharedBuffer(RelationGetSmgr(reln), forkNum, blockNum);
+	}
+}
+
+/*
+ * ReadBuffersAsync -- read multiple blocks into shared buffers with async I/O
+ *
+ * This function is designed for bulk prefetching where the caller has already
+ * determined that the blocks are NOT in the buffer pool (e.g., via optimistic
+ * lookup). It will:
+ *
+ * 1. Initiate async I/O for all requested blocks in one batch
+ * 2. Wait for all I/Os to complete
+ * 3. Return with all buffers pinned
+ *
+ * The blocks do NOT need to be adjacent or in any particular order.
+ *
+ * Parameters:
+ *   smgr_reln: SMgrRelation for the relation
+ *   persistence: Relation persistence (for local vs shared buffers)
+ *   forkNum: Fork number
+ *   blockNums: Array of block numbers to read (can be non-adjacent)
+ *   buffers: Output array for pinned buffers (must be pre-allocated, nblocks size)
+ *   nblocks: Number of blocks to read
+ *
+ * On return, buffers[] will contain pinned buffer handles for all blocks.
+ * The caller is responsible for unpinning them when done.
+ */
+void
+ReadBuffersAsync(SMgrRelation smgr_reln,
+				 char persistence,
+				 ForkNumber forkNum,
+				 BlockNumber *blockNums,
+				 int nblocks)
+{
+	ReadBuffersOperation operations[128];
+	Buffer	   *range_buffers_array[128];
+	int			range_sizes[128];
+	int			num_ranges = 0;
+	int			flags = 0;
+	int			i = 0;
+
+	if (nblocks <= 0)
+		return;
+
+	/* 
+	 * First pass: count how many contiguous ranges we have.
+	 */
+	while (i < nblocks)
+	{
+		int range_size = 1;
+		while (i + range_size < nblocks &&
+			   blockNums[i + range_size] == blockNums[i] + range_size)
+		{
+			range_size++;
+		}
+		num_ranges++;
+		i += range_size;
+	}
+
+	/* Second pass: prepare all operations */
+	i = 0;
+	for (int range_idx = 0; range_idx < num_ranges; range_idx++)
+	{
+		BlockNumber start_block = blockNums[i];
+		int range_size = 1;
+		
+		/* Find the length of this consecutive range */
+		while (i + range_size < nblocks &&
+			   blockNums[i + range_size] == start_block + range_size)
+		{
+			range_size++;
+		}
+
+		/* Initialize operation for this range */
+		operations[range_idx].smgr = smgr_reln;
+		operations[range_idx].rel = NULL;
+		operations[range_idx].persistence = persistence;
+		operations[range_idx].forknum = forkNum;
+		operations[range_idx].strategy = NULL;
+
+		/* Allocate buffer array for this range */
+		range_buffers_array[range_idx] = (Buffer *) palloc(sizeof(Buffer) * range_size);
+		for (int j = 0; j < range_size; j++)
+			range_buffers_array[range_idx][j] = InvalidBuffer;
+		
+		range_sizes[range_idx] = range_size;
+		
+		i += range_size;
+	}
+
+	/*
+	 * Enter batch mode to stage all I/Os without submitting them.
+	 * This is critical for performance - we want to submit all I/Os
+	 * in one batch to the kernel.
+	 */
+	pgaio_enter_batchmode();
+
+	/* Third pass: start all reads (staged but not submitted) */
+	i = 0;
+	for (int range_idx = 0; range_idx < num_ranges; range_idx++)
+	{
+		BlockNumber start_block = blockNums[i];
+		int range_size = range_sizes[range_idx];
+		bool need_wait;
+		
+		/* Start the read - this stages but doesn't submit in batch mode */
+		need_wait = StartReadBuffers(&operations[range_idx],
+									 range_buffers_array[range_idx],
+									 start_block,
+									 &range_size,
+									 flags);
+		
+		/* 
+		 * If StartReadBuffers returned false, no I/O was needed (all buffers were cache hits).
+		 * Mark this operation so we know not to wait for it.
+		 */
+		if (!need_wait)
+		{
+			operations[range_idx].nblocks = 0;
+		}
+		
+		i += range_sizes[range_idx];
+	}
+
+	/*
+	 * Exit batch mode - this submits ALL staged I/Os to the kernel
+	 * in one efficient batch operation.
+	 */
+	pgaio_exit_batchmode();
+
+	/* Fourth pass: wait for all I/Os to complete */
+	for (int range_idx = 0; range_idx < num_ranges; range_idx++)
+	{
+		/* 
+		 * Only wait if I/O was actually started (need_wait was true).
+		 * We marked operations with no I/O by setting nblocks to 0.
+		 */
+		if (operations[range_idx].nblocks > 0)
+		{
+			WaitReadBuffers(&operations[range_idx]);
+		}
+		
+		/* Release the pinned buffers - caller will re-pin via mapping table */
+		for (int j = 0; j < range_sizes[range_idx]; j++)
+		{
+			if (BufferIsValid(range_buffers_array[range_idx][j]))
+				ReleaseBuffer(range_buffers_array[range_idx][j]);
+		}
+		
+		pfree(range_buffers_array[range_idx]);
 	}
 }
 
@@ -1079,8 +1215,11 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 		 * LockBufferForCleanup() here, because they assert that the buffer is
 		 * already valid.)
 		 */
-		if (!isLocalBuf)
-			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+		if (!isLocalBuf){
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			//LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+		}
+			
 
 		/* Set BM_VALID, terminate IO, and wake up any waiters */
 		if (isLocalBuf)
@@ -2002,159 +2141,8 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			BufferAccessStrategy strategy,
 			bool *foundPtr, IOContext io_context)
 {
-	BufferTag	newTag;			/* identity of requested block */
-	uint32		newHash;		/* hash value for newTag */
-	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
-	int			existing_buf_id;
-	Buffer		victim_buffer;
-	BufferDesc *victim_buf_hdr;
-	uint32		victim_buf_state;
-
-	/* Make sure we will have room to remember the buffer pin */
-	ResourceOwnerEnlarge(CurrentResourceOwner);
-	ReservePrivateRefCountEntry();
-
-	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
-
-	/* determine its hash code and partition lock ID */
-	newHash = BufTableHashCode(&newTag);
-	newPartitionLock = BufMappingPartitionLock(newHash);
-
-	/* see if the block is in the buffer pool already */
-	LWLockAcquire(newPartitionLock, LW_SHARED);
-	existing_buf_id = BufTableLookup(&newTag, newHash);
-	if (existing_buf_id >= 0)
-	{
-		BufferDesc *buf;
-		bool		valid;
-
-		/*
-		 * Found it.  Now, pin the buffer so no one can steal it from the
-		 * buffer pool, and check to see if the correct data has been loaded
-		 * into the buffer.
-		 */
-		buf = GetBufferDescriptor(existing_buf_id);
-
-		valid = PinBuffer(buf, strategy);
-
-		/* Can release the mapping lock as soon as we've pinned it */
-		LWLockRelease(newPartitionLock);
-
-		*foundPtr = true;
-
-		if (!valid)
-		{
-			/*
-			 * We can only get here if (a) someone else is still reading in
-			 * the page, (b) a previous read attempt failed, or (c) someone
-			 * called StartReadBuffers() but not yet WaitReadBuffers().
-			 */
-			*foundPtr = false;
-		}
-
-		return buf;
-	}
-
-	/*
-	 * Didn't find it in the buffer pool.  We'll have to initialize a new
-	 * buffer.  Remember to unlock the mapping lock while doing the work.
-	 */
-	LWLockRelease(newPartitionLock);
-
-	/*
-	 * Acquire a victim buffer. Somebody else might try to do the same, we
-	 * don't hold any conflicting locks. If so we'll have to undo our work
-	 * later.
-	 */
-	victim_buffer = GetVictimBuffer(strategy, io_context);
-	victim_buf_hdr = GetBufferDescriptor(victim_buffer - 1);
-
-	/*
-	 * Try to make a hashtable entry for the buffer under its new tag. If
-	 * somebody else inserted another buffer for the tag, we'll release the
-	 * victim buffer we acquired and use the already inserted one.
-	 */
-	LWLockAcquire(newPartitionLock, LW_EXCLUSIVE);
-	existing_buf_id = BufTableInsert(&newTag, newHash, victim_buf_hdr->buf_id);
-	if (existing_buf_id >= 0)
-	{
-		BufferDesc *existing_buf_hdr;
-		bool		valid;
-
-		/*
-		 * Got a collision. Someone has already done what we were about to do.
-		 * We'll just handle this as if it were found in the buffer pool in
-		 * the first place.  First, give up the buffer we were planning to
-		 * use.
-		 *
-		 * We could do this after releasing the partition lock, but then we'd
-		 * have to call ResourceOwnerEnlarge() & ReservePrivateRefCountEntry()
-		 * before acquiring the lock, for the rare case of such a collision.
-		 */
-		UnpinBuffer(victim_buf_hdr);
-
-		/*
-		 * The victim buffer we acquired previously is clean and unused, let
-		 * it be found again quickly
-		 */
-		StrategyFreeBuffer(victim_buf_hdr);
-
-		/* remaining code should match code at top of routine */
-
-		existing_buf_hdr = GetBufferDescriptor(existing_buf_id);
-
-		valid = PinBuffer(existing_buf_hdr, strategy);
-
-		/* Can release the mapping lock as soon as we've pinned it */
-		LWLockRelease(newPartitionLock);
-
-		*foundPtr = true;
-
-		if (!valid)
-		{
-			/*
-			 * We can only get here if (a) someone else is still reading in
-			 * the page, (b) a previous read attempt failed, or (c) someone
-			 * called StartReadBuffers() but not yet WaitReadBuffers().
-			 */
-			*foundPtr = false;
-		}
-
-		return existing_buf_hdr;
-	}
-
-	/*
-	 * Need to lock the buffer header too in order to change its tag.
-	 */
-	victim_buf_state = LockBufHdr(victim_buf_hdr);
-
-	/* some sanity checks while we hold the buffer header lock */
-	Assert(BUF_STATE_GET_REFCOUNT(victim_buf_state) == 1);
-	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
-
-	victim_buf_hdr->tag = newTag;
-
-	/*
-	 * Make sure BM_PERMANENT is set for buffers that must be written at every
-	 * checkpoint.  Unlogged buffers only need to be written at shutdown
-	 * checkpoints, except for their "init" forks, which need to be treated
-	 * just like permanent relations.
-	 */
-	victim_buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
-	if (relpersistence == RELPERSISTENCE_PERMANENT || forkNum == INIT_FORKNUM)
-		victim_buf_state |= BM_PERMANENT;
-
-	UnlockBufHdr(victim_buf_hdr, victim_buf_state);
-
-	LWLockRelease(newPartitionLock);
-
-	/*
-	 * Buffer contents are currently invalid.
-	 */
-	*foundPtr = false;
-
-	return victim_buf_hdr;
+	return ActiveBufMgr->LookupAndPin(smgr, relpersistence, forkNum, blockNum,
+									  strategy, foundPtr, io_context);
 }
 
 /*
@@ -2177,91 +2165,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 static void
 InvalidateBuffer(BufferDesc *buf)
 {
-	BufferTag	oldTag;
-	uint32		oldHash;		/* hash value for oldTag */
-	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
-	uint32		oldFlags;
-	uint32		buf_state;
-
-	/* Save the original buffer tag before dropping the spinlock */
-	oldTag = buf->tag;
-
-	buf_state = pg_atomic_read_u32(&buf->state);
-	Assert(buf_state & BM_LOCKED);
-	UnlockBufHdr(buf, buf_state);
-
-	/*
-	 * Need to compute the old tag's hashcode and partition lock ID. XXX is it
-	 * worth storing the hashcode in BufferDesc so we need not recompute it
-	 * here?  Probably not.
-	 */
-	oldHash = BufTableHashCode(&oldTag);
-	oldPartitionLock = BufMappingPartitionLock(oldHash);
-
-retry:
-
-	/*
-	 * Acquire exclusive mapping lock in preparation for changing the buffer's
-	 * association.
-	 */
-	LWLockAcquire(oldPartitionLock, LW_EXCLUSIVE);
-
-	/* Re-lock the buffer header */
-	buf_state = LockBufHdr(buf);
-
-	/* If it's changed while we were waiting for lock, do nothing */
-	if (!BufferTagsEqual(&buf->tag, &oldTag))
-	{
-		UnlockBufHdr(buf, buf_state);
-		LWLockRelease(oldPartitionLock);
-		return;
-	}
-
-	/*
-	 * We assume the reason for it to be pinned is that either we were
-	 * asynchronously reading the page in before erroring out or someone else
-	 * is flushing the page out.  Wait for the IO to finish.  (This could be
-	 * an infinite loop if the refcount is messed up... it would be nice to
-	 * time out after awhile, but there seems no way to be sure how many loops
-	 * may be needed.  Note that if the other guy has pinned the buffer but
-	 * not yet done StartBufferIO, WaitIO will fall through and we'll
-	 * effectively be busy-looping here.)
-	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
-		UnlockBufHdr(buf, buf_state);
-		LWLockRelease(oldPartitionLock);
-		/* safety check: should definitely not be our *own* pin */
-		if (GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) > 0)
-			elog(ERROR, "buffer is pinned in InvalidateBuffer");
-		WaitIO(buf);
-		goto retry;
-	}
-
-	/*
-	 * Clear out the buffer's tag and flags.  We must do this to ensure that
-	 * linear scans of the buffer array don't think the buffer is valid.
-	 */
-	oldFlags = buf_state & BUF_FLAG_MASK;
-	ClearBufferTag(&buf->tag);
-	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
-	UnlockBufHdr(buf, buf_state);
-
-	/*
-	 * Remove the buffer from the lookup hashtable, if it was in there.
-	 */
-	if (oldFlags & BM_TAG_VALID)
-		BufTableDelete(&oldTag, oldHash);
-
-	/*
-	 * Done with mapping lock.
-	 */
-	LWLockRelease(oldPartitionLock);
-
-	/*
-	 * Insert the buffer at the head of the list of free buffers.
-	 */
-	StrategyFreeBuffer(buf);
+	ActiveBufMgr->ForceInvalidateBuffer(buf);
 }
 
 /*
@@ -2276,72 +2180,10 @@ retry:
 static bool
 InvalidateVictimBuffer(BufferDesc *buf_hdr)
 {
-	uint32		buf_state;
-	uint32		hash;
-	LWLock	   *partition_lock;
-	BufferTag	tag;
-
-	Assert(GetPrivateRefCount(BufferDescriptorGetBuffer(buf_hdr)) == 1);
-
-	/* have buffer pinned, so it's safe to read tag without lock */
-	tag = buf_hdr->tag;
-
-	hash = BufTableHashCode(&tag);
-	partition_lock = BufMappingPartitionLock(hash);
-
-	LWLockAcquire(partition_lock, LW_EXCLUSIVE);
-
-	/* lock the buffer header */
-	buf_state = LockBufHdr(buf_hdr);
-
-	/*
-	 * We have the buffer pinned nobody else should have been able to unset
-	 * this concurrently.
-	 */
-	Assert(buf_state & BM_TAG_VALID);
-	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-	Assert(BufferTagsEqual(&buf_hdr->tag, &tag));
-
-	/*
-	 * If somebody else pinned the buffer since, or even worse, dirtied it,
-	 * give up on this buffer: It's clearly in use.
-	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 1 || (buf_state & BM_DIRTY))
-	{
-		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-
-		UnlockBufHdr(buf_hdr, buf_state);
-		LWLockRelease(partition_lock);
-
-		return false;
-	}
-
-	/*
-	 * Clear out the buffer's tag and flags and usagecount.  This is not
-	 * strictly required, as BM_TAG_VALID/BM_VALID needs to be checked before
-	 * doing anything with the buffer. But currently it's beneficial, as the
-	 * cheaper pre-check for several linear scans of shared buffers use the
-	 * tag (see e.g. FlushDatabaseBuffers()).
-	 */
-	ClearBufferTag(&buf_hdr->tag);
-	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
-	UnlockBufHdr(buf_hdr, buf_state);
-
-	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-
-	/* finally delete buffer from the buffer mapping table */
-	BufTableDelete(&tag, hash);
-
-	LWLockRelease(partition_lock);
-
-	Assert(!(buf_state & (BM_DIRTY | BM_VALID | BM_TAG_VALID)));
-	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-	Assert(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf_hdr->state)) > 0);
-
-	return true;
+	return ActiveBufMgr->InvalidateVictimBuffer(buf_hdr);
 }
 
-static Buffer
+Buffer
 GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 {
 	BufferDesc *buf_hdr;
@@ -2862,8 +2704,11 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				lock = true;
 		}
 
-		if (lock)
-			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
+		if (lock){
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			//LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
+		}
+			
 
 		TerminateBufferIO(buf_hdr, false, BM_VALID, true, false);
 	}
@@ -3063,7 +2908,7 @@ ReleaseAndReadBuffer(Buffer buffer,
  * Returns true if buffer is BM_VALID, else false.  This provision allows
  * some callers to avoid an extra spinlock cycle.
  */
-static bool
+bool
 PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 {
 	Buffer		b = BufferDescriptorGetBuffer(buf);
@@ -3255,7 +3100,7 @@ WakePinCountWaiter(BufferDesc *buf)
  * This should be applied only to shared buffers, never local ones.  This
  * always adjusts CurrentResourceOwner.
  */
-static void
+void
 UnpinBuffer(BufferDesc *buf)
 {
 	Buffer		b = BufferDescriptorGetBuffer(buf);
@@ -4032,6 +3877,67 @@ InitBufferManagerAccess(void)
 	 */
 	Assert(MyProc != NULL);
 	on_shmem_exit(AtProcExit_Buffers, 0);
+}
+
+/*
+ * BufferManagerGucInit
+ *
+ * Initialize the buffer manager strategy GUC variable.
+ * This must be called very early in postmaster startup, before any
+ * buffer manager operations occur.
+ */
+void
+BufferManagerGucInit(void)
+{
+	DefineCustomStringVariable("custom.buffer_manager_api",
+							   "Selects which buffer manager implementation to use.",
+							   "Valid values are 'hashtable' and 'calico'.",
+							   &buffer_manager_api_string,
+							   "hashtable",
+							   PGC_SIGHUP,
+							   0,
+							   NULL, NULL, NULL);
+	
+	DefineCustomBoolVariable("custom.enable_optimistic_buffer_reads",
+							 "Enables optimistic read optimization for buffer pool lookups.",
+							 "This optimization uses version numbers to avoid locking during read operations. "
+							 "Only effective with Calico buffer manager.",
+							 &enable_optimistic_buffer_reads,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+}
+
+/*
+ * BufferManagerStrategySelection
+ *
+ * Sets ActiveBufMgr to point to the appropriate BufferManagerAPI implementation
+ * based on the GUC setting. This should be called during shared memory
+ * initialization, before any buffer operations occur.
+ */
+void
+BufferManagerStrategySelection(void)
+{
+	if (buffer_manager_api_string == NULL ||
+		strcmp(buffer_manager_api_string, "hashtable") == 0)
+	{
+		ActiveBufMgr = &HashTableAPI;
+		elog(LOG, "Using HashTable buffer manager");
+	}
+	else if (strcmp(buffer_manager_api_string, "calico") == 0)
+	{
+		ActiveBufMgr = &CalicoAPI;
+		elog(LOG, "Using Calico buffer manager");
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid value for parameter \"buffer_manager_api\": \"%s\"",
+						buffer_manager_api_string),
+				 errhint("Valid values are \"hashtable\" and \"calico\".")));
+	}
 }
 
 /*
@@ -5608,11 +5514,25 @@ LockBuffer(Buffer buffer, int mode)
 	buf = GetBufferDescriptor(buffer - 1);
 
 	if (mode == BUFFER_LOCK_UNLOCK)
+	{
+		/* Clear the locked state in the buffer mapping */
+		// only call SetBufferLocked if it is unlock a write lock for. the content lock
+		if (ActiveBufMgr->SetBufferLocked && LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+			ActiveBufMgr->SetBufferLocked(buf, false);
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
+	}
 	else if (mode == BUFFER_LOCK_SHARE)
+	{
 		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+		/* Shared locks don't set the locked state */
+	}
 	else if (mode == BUFFER_LOCK_EXCLUSIVE)
+	{
 		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+		/* Set the locked state in the buffer mapping */
+		if (ActiveBufMgr->SetBufferLocked)
+			ActiveBufMgr->SetBufferLocked(buf, true);
+	}
 	else
 		elog(ERROR, "unrecognized buffer lock mode: %d", mode);
 }
@@ -5626,6 +5546,7 @@ bool
 ConditionalLockBuffer(Buffer buffer)
 {
 	BufferDesc *buf;
+	bool		locked;
 
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
@@ -5633,8 +5554,14 @@ ConditionalLockBuffer(Buffer buffer)
 
 	buf = GetBufferDescriptor(buffer - 1);
 
-	return LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf),
-									LW_EXCLUSIVE);
+	locked = LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf),
+									  LW_EXCLUSIVE);
+	
+	/* If we successfully acquired the lock, set the locked state */
+	if (locked && ActiveBufMgr->SetBufferLocked)
+		ActiveBufMgr->SetBufferLocked(buf, true);
+	
+	return locked;
 }
 
 /*
@@ -5955,7 +5882,7 @@ IsBufferCleanupOK(Buffer buffer)
 /*
  * WaitIO -- Block until the IO_IN_PROGRESS flag on 'buf' is cleared.
  */
-static void
+void
 WaitIO(BufferDesc *buf)
 {
 	ConditionVariable *cv = BufferDescriptorGetIOCV(buf);

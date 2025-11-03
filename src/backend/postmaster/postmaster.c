@@ -110,6 +110,8 @@
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
+#include "storage/bufmgr.h"
+#include "storage/calico.h"
 #include "storage/fd.h"
 #include "storage/io_worker.h"
 #include "storage/ipc.h"
@@ -587,6 +589,9 @@ PostmasterMain(int argc, char *argv[])
 	 * Options setup
 	 */
 	InitializeGUCOptions();
+	
+	BufferManagerGucInit();
+	CalicoGucInit();
 
 	opterr = 1;
 

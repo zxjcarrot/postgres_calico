@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "storage/buf_internals.h"
+#include "storage/calico.h"
 
 /* entry for buffer lookup hashtable */
 typedef struct
@@ -81,6 +82,23 @@ BufTableHashCode(BufferTag *tagPtr)
 }
 
 /*
+ * ShouldRouteToCalico
+ *		Determines if buffer operations should be routed to Calico
+ *
+ * Returns true if Calico is ready and we're in a normal backend context.
+ * Returns false during bootstrap, init processing, or if Calico isn't ready.
+ */
+static inline bool
+ShouldRouteToCalico(void)
+{
+	if (!Calico_IsReady())
+		return false;
+	if (IsBootstrapProcessingMode() || IsInitProcessingMode() || !IsUnderPostmaster)
+		return false;
+	return true;
+}
+
+/*
  * BufTableLookup
  *		Lookup the given BufferTag; return buffer ID, or -1 if not found
  *
@@ -89,6 +107,11 @@ BufTableHashCode(BufferTag *tagPtr)
 int
 BufTableLookup(BufferTag *tagPtr, uint32 hashcode)
 {
+	if (ShouldRouteToCalico())
+	{
+		return CalicoShim_BufTableLookup(tagPtr, hashcode);
+	}
+
 	BufferLookupEnt *result;
 
 	result = (BufferLookupEnt *)
@@ -117,6 +140,11 @@ BufTableLookup(BufferTag *tagPtr, uint32 hashcode)
 int
 BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id)
 {
+	if (ShouldRouteToCalico())
+	{
+		return CalicoShim_BufTableInsert(tagPtr, hashcode, buf_id);
+	}
+
 	BufferLookupEnt *result;
 	bool		found;
 
@@ -147,6 +175,12 @@ BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id)
 void
 BufTableDelete(BufferTag *tagPtr, uint32 hashcode)
 {
+	if (ShouldRouteToCalico())
+	{
+		CalicoShim_BufTableDelete(tagPtr, hashcode);
+		return;
+	}
+
 	BufferLookupEnt *result;
 
 	result = (BufferLookupEnt *)

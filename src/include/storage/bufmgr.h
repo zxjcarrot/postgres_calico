@@ -157,6 +157,7 @@ extern PGDLLIMPORT bool zero_damaged_pages;
 extern PGDLLIMPORT int bgwriter_lru_maxpages;
 extern PGDLLIMPORT double bgwriter_lru_multiplier;
 extern PGDLLIMPORT bool track_io_timing;
+extern PGDLLIMPORT bool enable_optimistic_buffer_reads;
 
 #define DEFAULT_EFFECTIVE_IO_CONCURRENCY 16
 #define DEFAULT_MAINTENANCE_IO_CONCURRENCY 16
@@ -206,6 +207,11 @@ extern PrefetchBufferResult PrefetchSharedBuffer(struct SMgrRelationData *smgr_r
 												 BlockNumber blockNum);
 extern PrefetchBufferResult PrefetchBuffer(Relation reln, ForkNumber forkNum,
 										   BlockNumber blockNum);
+extern void ReadBuffersAsync(struct SMgrRelationData *smgr_reln,
+							 char persistence,
+							 ForkNumber forkNum,
+							 BlockNumber *blockNums,
+							 int nblocks);
 extern bool ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum,
 							 BlockNumber blockNum, Buffer recent_buffer);
 extern Buffer ReadBuffer(Relation reln, BlockNumber blockNum);
@@ -257,6 +263,12 @@ extern Buffer ExtendBufferedRelTo(BufferManagerRelation bmr,
 								  ReadBufferMode mode);
 
 extern void InitBufferManagerAccess(void);
+
+/* Buffer manager strategy selection and initialization */
+extern void BufferManagerGucInit(void);
+extern void BufferManagerStrategySelection(void);
+extern void CalicoGucInit(void);
+
 extern void AtEOXact_Buffers(bool isCommit);
 #ifdef USE_ASSERT_CHECKING
 extern void AssertBufferLocksPermitCatalogRead(void);

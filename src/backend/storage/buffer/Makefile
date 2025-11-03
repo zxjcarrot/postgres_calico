@@ -17,6 +17,8 @@ OBJS = \
 	buf_table.o \
 	bufmgr.o \
 	freelist.o \
-	localbuf.o
+	localbuf.o \
+	hashtable.o \
+	calico.o
 
 include $(top_srcdir)/src/backend/common.mk
