@@ -124,7 +124,7 @@ typedef CalicoTranslationEntry *SecondLevelTable;
  */
 static pg_atomic_uint64 *CalicoTopLevelTable;
 
-#define MAX_RELATION_IDS        (1U << 20) /* ~1M relation forks */
+#define MAX_RELATION_IDS        (1U << 14) /* ~1M relation forks */
 #define MAX_BLOCKS_PER_REL      (1U << 24) /* up to 16M blocks per rel-fork */
 
 /* -------------------------------------------------------------------------
@@ -216,7 +216,7 @@ CalicoShmemInit(void)
         // madvise huge page
         madvise(CalicoTopLevelTable,
                  MAX_RELATION_IDS * sizeof(pg_atomic_uint64),
-                 MADV_HUGEPAGE);
+                 MADV_NOHUGEPAGE);
     }
 
     /* 4) Dedicated partition locks for Calico directory operations */
@@ -236,7 +236,9 @@ CalicoShmemInit(void)
      * Some core code paths assume it exists even if we don't use it
      * for the fast path. This avoids null deref / unexpected asserts.
      */
-    InitBufTable(NBuffers + NUM_BUFFER_PARTITIONS);
+    //InitBufTable(NBuffers + NUM_BUFFER_PARTITIONS);
+    // Use a tiny hashtable to reduce memory usage on Calico
+    InitBufTable(128 + NUM_BUFFER_PARTITIONS);
     CalicoReady = true;
 }
 
@@ -262,130 +264,81 @@ CalicoGucInit(void)
  *      RelationID helpers: create-or-find and find-only (no create)
  * ------------------------------------------------------------------------- */
 
-/* Backend-local cache using static hash table with linear probing */
-#define LOCAL_CACHE_SIZE 1024
-#define LOCAL_CACHE_MASK (LOCAL_CACHE_SIZE - 1)
-
-typedef struct CalicoLocalCacheEntry
+/*
+ * Thread-Local Storage (TLS) Cache for Translation Path
+ * 
+ * Each thread caches the most recently accessed translation path to eliminate
+ * repeated top-level lookups. The cache stores:
+ * 1. The last accessed BufferTag (spcOid, dbOid, relNumber, forkNum)
+ * 2. The corresponding relation_id
+ * 3. The corresponding last-level translation table pointer
+ * 
+ * On each page access, the thread first checks if the current BufferTag's
+ * high bits (relation identity) match the cached value. On a cache hit,
+ * the thread directly uses the cached last-level table pointer.
+ */
+typedef struct CalicoTLSCache
 {
-    CalicoRelFork key;
-    uint32        relation_id;
-    bool          valid;
-} CalicoLocalCacheEntry;
-
-static CalicoLocalCacheEntry local_cache_table[LOCAL_CACHE_SIZE];
-static bool local_cache_initialized = false;
-
-/* Simple hash function for CalicoRelFork */
-static inline uint32
-CalicoLocalCacheHash(const CalicoRelFork *key)
-{
-    uint32 hash = 0;
-    hash ^= (uint32)key->spcOid;
-    hash ^= (uint32)key->dbOid << 8;
-    hash ^= (uint32)key->relNumber << 16;
-    hash ^= (uint32)key->forkNum << 24;
-    /* Mix bits */
-    hash ^= hash >> 16;
-    hash *= 0x85ebca6b;
-    hash ^= hash >> 13;
-    hash *= 0xc2b2ae35;
-    hash ^= hash >> 16;
-    return hash;
-}
-
-/* Compare two CalicoRelFork keys */
-static inline bool
-CalicoRelForkEqual(const CalicoRelFork *a, const CalicoRelFork *b)
-{
-    // use memcmp
-    return memcmp(a, b, sizeof(CalicoRelFork)) == 0;
-}
-
-/* Lookup in local cache, returns true if found */
-static inline bool
-CalicoLocalCacheLookup(const CalicoRelFork *key, uint32 *out_relation_id)
-{
-    uint32 hash;
-    uint32 slot;
-    uint32 probe_count;
-    CalicoLocalCacheEntry *entry;
+    /* Cached BufferTag components (relation identity) */
+    Oid             cached_spcOid;
+    Oid             cached_dbOid;
+    RelFileNumber   cached_relNumber;
+    ForkNumber      cached_forkNum;
     
-    if (!local_cache_initialized)
+    /* Cached translation path */
+    uint32          cached_relation_id;
+    SecondLevelTable cached_l2_table;
+    
+    /* Validity flag */
+    bool            valid;
+} CalicoTLSCache;
+
+/* Thread-local storage for translation path cache */
+static __thread CalicoTLSCache tls_cache = {0};
+
+/*
+ * CalicoTLSCacheLookup - Check if the translation path is cached
+ * 
+ * Returns true if the BufferTag matches the cached entry, and sets
+ * out_relation_id and out_l2_table to the cached values.
+ */
+static inline bool
+CalicoTLSCacheLookup(Oid spcOid, Oid dbOid, RelFileNumber relNumber, ForkNumber forkNum,
+                     uint32 *out_relation_id, SecondLevelTable *out_l2_table)
+{
+    if (!tls_cache.valid)
+        return false;
+    
+    /* Check if BufferTag matches cached value */
+    if (tls_cache.cached_spcOid == spcOid &&
+        tls_cache.cached_dbOid == dbOid &&
+        tls_cache.cached_relNumber == relNumber &&
+        tls_cache.cached_forkNum == forkNum)
     {
-        memset(local_cache_table, 0, sizeof(local_cache_table));
-        local_cache_initialized = true;
+        *out_relation_id = tls_cache.cached_relation_id;
+        *out_l2_table = tls_cache.cached_l2_table;
+        return true;
     }
     
-    hash = CalicoLocalCacheHash(key);
-    slot = hash & LOCAL_CACHE_MASK;
-    
-    /* Linear probing */
-    for (probe_count = 0; probe_count < LOCAL_CACHE_SIZE; probe_count++)
-    {
-        entry = &local_cache_table[slot];
-        
-        if (!entry->valid)
-            return false; /* Empty slot, not found */
-        
-        if (CalicoRelForkEqual(&entry->key, key))
-        {
-            *out_relation_id = entry->relation_id;
-            return true;
-        }
-        
-        slot = (slot + 1) & LOCAL_CACHE_MASK;
-    }
-    
-    return false; /* Cache full and not found */
+    return false;
 }
 
-/* Insert into local cache */
+/*
+ * CalicoTLSCacheUpdate - Update the thread-local cache
+ * 
+ * Stores the translation path for the given BufferTag.
+ */
 static inline void
-CalicoLocalCacheInsert(const CalicoRelFork *key, uint32 relation_id)
+CalicoTLSCacheUpdate(Oid spcOid, Oid dbOid, RelFileNumber relNumber, ForkNumber forkNum,
+                     uint32 relation_id, SecondLevelTable l2_table)
 {
-    uint32 hash;
-    uint32 slot;
-    uint32 probe_count;
-    CalicoLocalCacheEntry *entry;
-    
-    if (!local_cache_initialized)
-    {
-        memset(local_cache_table, 0, sizeof(local_cache_table));
-        local_cache_initialized = true;
-    }
-    
-    hash = CalicoLocalCacheHash(key);
-    slot = hash & LOCAL_CACHE_MASK;
-    
-    /* Linear probing to find empty slot or matching key */
-    for (probe_count = 0; probe_count < LOCAL_CACHE_SIZE; probe_count++)
-    {
-        entry = &local_cache_table[slot];
-        
-        if (!entry->valid)
-        {
-            /* Empty slot, insert here */
-            entry->key = *key;
-            entry->relation_id = relation_id;
-            entry->valid = true;
-            return;
-        }
-        
-        if (CalicoRelForkEqual(&entry->key, key))
-        {
-            /* Already exists, update */
-            entry->relation_id = relation_id;
-            return;
-        }
-        
-        slot = (slot + 1) & LOCAL_CACHE_MASK;
-    }
-    
-    /* Cache is full, we could evict or just skip insertion */
-    /* For simplicity, just skip - the shared lookup will still work */
-    // crash the server
-    ereport(WARNING, (errmsg("Calico local cache is full, skipping insertion")));
+    tls_cache.cached_spcOid = spcOid;
+    tls_cache.cached_dbOid = dbOid;
+    tls_cache.cached_relNumber = relNumber;
+    tls_cache.cached_forkNum = forkNum;
+    tls_cache.cached_relation_id = relation_id;
+    tls_cache.cached_l2_table = l2_table;
+    tls_cache.valid = true;
 }
 
 /* create-or-find - internal function */
@@ -396,15 +349,16 @@ CalicoGetRelationIDInternal(Oid spcOid, Oid dbOid, RelFileNumber relNumber, Fork
     bool found;
     CalicoRelMapEntry *entry;
     uint32 rid;
+    SecondLevelTable dummy_l2;
+
+    /* TLS cache first - check if this relation is cached */
+    if (CalicoTLSCacheLookup(spcOid, dbOid, relNumber, forkNum, &rid, &dummy_l2))
+        return rid;
 
     key.spcOid    = spcOid;
     key.dbOid     = dbOid;
     key.relNumber = relNumber;
     key.forkNum   = forkNum;
-
-    /* local cache first */
-    if (CalicoLocalCacheLookup(&key, &rid))
-        return rid;
 
     /* shared hash (double-checked, partition-locked) */
     uint32 hashv = get_hash_value(CalicoRelMap, (const void *)&key);
@@ -420,9 +374,9 @@ CalicoGetRelationIDInternal(Oid spcOid, Oid dbOid, RelFileNumber relNumber, Fork
     {
         rid = entry->relation_id;
         LWLockRelease(plock);
-
-        /* Cache in local table */
-        CalicoLocalCacheInsert(&key, rid);
+        
+        /* Note: We don't update TLS cache here because we don't have L2 table yet.
+         * The L2 table will be fetched and cached in CalicoLookupAndPin. */
         return rid;
     }
 
@@ -447,8 +401,6 @@ CalicoGetRelationIDInternal(Oid spcOid, Oid dbOid, RelFileNumber relNumber, Fork
     rid = entry->relation_id;
     LWLockRelease(plock);
 
-    /* Cache in local table */
-    CalicoLocalCacheInsert(&key, rid);
     return rid;
 }
 
@@ -691,54 +643,68 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
                         errmsg("block number %u is out of range for Calico", blockNum)));
     }
         
-    /* compute relation_id (create-or-find, like hashtable path implies by use) */
-    uint32 relation_id = CalicoGetRelationIDInternal(rlocator->spcOid, rlocator->dbOid,
-                                                      rlocator->relNumber, forkNum);
-
-    /* fetch/create second-level table pointer */
+    /* Try TLS cache first - check if we have the translation path cached */
+    uint32 relation_id;
     SecondLevelTable second_level_table;
-    bool found_shmem;
-    char name[64];
-    SecondLevelTable new_tab;
-    uint64 expected;
-    uint64 desired;
-    uint64 p;
+    bool tls_hit = CalicoTLSCacheLookup(rlocator->spcOid, rlocator->dbOid,
+                                        rlocator->relNumber, forkNum,
+                                        &relation_id, &second_level_table);
     
-    p = pg_atomic_read_u64(&CalicoTopLevelTable[relation_id]);
-    if (unlikely(p == 0))
+    if (!tls_hit)
     {
-        snprintf(name, sizeof(name), "Calico 2nd-Level Table %u", relation_id);
+        /* TLS cache miss - compute relation_id and fetch L2 table */
+        relation_id = CalicoGetRelationIDInternal(rlocator->spcOid, rlocator->dbOid,
+                                                   rlocator->relNumber, forkNum);
 
-        new_tab = (SecondLevelTable)
-            ShmemInitStruct(name,
-                            (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
-                            &found_shmem);
-        if (!found_shmem)
+        /* fetch/create second-level table pointer */
+        bool found_shmem;
+        char name[64];
+        SecondLevelTable new_tab;
+        uint64 expected;
+        uint64 desired;
+        uint64 p;
+        
+        p = pg_atomic_read_u64(&CalicoTopLevelTable[relation_id]);
+        if (unlikely(p == 0))
         {
-            /* atomic initialize all entries to 0 */
-            // for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
-            //     pg_atomic_init_u64(&new_tab[i], 0);
-            //madvise huge page
-            madvise(new_tab,
-                     (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
-                     MADV_HUGEPAGE);
-        }
+            snprintf(name, sizeof(name), "Calico 2nd-Level Table %u", relation_id);
 
-        expected = 0;
-        desired  = (uint64)(uintptr_t)new_tab;
-        if (!pg_atomic_compare_exchange_u64(&CalicoTopLevelTable[relation_id], &expected, desired))
-        {
-            /* someone else installed it */
-            new_tab = (SecondLevelTable)(uintptr_t) expected;
+            new_tab = (SecondLevelTable)
+                ShmemInitStruct(name,
+                                (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
+                                &found_shmem);
+            if (!found_shmem)
+            {
+                /* atomic initialize all entries to 0 */
+                // for (uint32 i = 0; i < MAX_BLOCKS_PER_REL; i++)
+                //     pg_atomic_init_u64(&new_tab[i], 0);
+                //madvise huge page
+                madvise(new_tab,
+                         (Size)MAX_BLOCKS_PER_REL * sizeof(CalicoTranslationEntry),
+                         MADV_NOHUGEPAGE);
+            }
+
+            expected = 0;
+            desired  = (uint64)(uintptr_t)new_tab;
+            if (!pg_atomic_compare_exchange_u64(&CalicoTopLevelTable[relation_id], &expected, desired))
+            {
+                /* someone else installed it */
+                new_tab = (SecondLevelTable)(uintptr_t) expected;
+            }
+            second_level_table = new_tab;
+            fprintf(stderr, "Created Calico L2 table for %s of size %zu\n", name, sizeof(CalicoTranslationEntry) * MAX_BLOCKS_PER_REL);
         }
-        second_level_table = new_tab;
-        fprintf(stderr, "Created Calico L2 table for %s of size %zu\n", name, sizeof(CalicoTranslationEntry) * MAX_BLOCKS_PER_REL);
-    }
-    else
-    {
-        second_level_table = (SecondLevelTable)(uintptr_t)p;
+        else
+        {
+            second_level_table = (SecondLevelTable)(uintptr_t)p;
+        }
+        
+        /* Update TLS cache with the translation path */
+        CalicoTLSCacheUpdate(rlocator->spcOid, rlocator->dbOid, rlocator->relNumber, forkNum,
+                             relation_id, second_level_table);
     }
     
+    /* Now we have the L2 table (either from cache or freshly fetched) */
     CalicoTranslationEntry *entry_ptr = &second_level_table[blockNum];
 
 
@@ -1315,13 +1281,10 @@ CalicoLookupAndOptimisticPinInternal(SMgrRelation smgr,
                                       bool *foundPtr,
                                       uint64 *versionOut,
                                       uint32 *frameIdOut,
-                                      void **entryPtrOut,
-                                      uint32 relation_id,
-                                      bool relation_id_provided)
+                                      void **entryPtrOut)
 {
     RelFileLocator *rlocator = &smgr->smgr_rlocator.locator;
     uint32 rid;
-    uint64 p;
     SecondLevelTable second;
     CalicoTranslationEntry *entry_ptr;
     uint64 entry_val;
@@ -1339,19 +1302,27 @@ CalicoLookupAndOptimisticPinInternal(SMgrRelation smgr,
     }
 
     
-    /* Get relation ID - use cached value if provided */
-    if (relation_id_provided)
-        rid = relation_id;
-    else
-        rid = CalicoGetRelationIDInternal(rlocator->spcOid, rlocator->dbOid,
-                                           rlocator->relNumber, forkNum);
-
-    /* Get second-level table */
-    p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
-    if (p == 0)
-        return NULL;
+    /* Try TLS cache first if relation_id not provided */
+    bool tls_hit = CalicoTLSCacheLookup(rlocator->spcOid, rlocator->dbOid,
+                                        rlocator->relNumber, forkNum,
+                                        &rid, &second);
     
-    second = (SecondLevelTable)(uintptr_t)p;
+    if (!tls_hit) {
+        /* TLS cache miss - get relation ID */
+        rid = CalicoGetRelationIDInternal(rlocator->spcOid, rlocator->dbOid,
+                                        rlocator->relNumber, forkNum);
+        /* Get second-level table */
+        uint64 p = pg_atomic_read_u64(&CalicoTopLevelTable[rid]);
+        if (p == 0)
+            return NULL;
+        
+        second = (SecondLevelTable)(uintptr_t)p;
+        
+        /* Update TLS cache with the translation path */
+        CalicoTLSCacheUpdate(rlocator->spcOid, rlocator->dbOid, rlocator->relNumber, forkNum,
+                                rid, second);
+    }
+
     entry_ptr = &second[blockNum];
     
     /* Read entry atomically */
@@ -1398,29 +1369,7 @@ CalicoLookupAndOptimisticPin(SMgrRelation smgr,
 {
     return CalicoLookupAndOptimisticPinInternal(smgr, forkNum, blockNum,
                                                  foundPtr, versionOut, frameIdOut,
-                                                 entryPtrOut, 0, false);
-}
-
-/*
- * CalicoLookupAndOptimisticPinWithRid - Optimistic lookup with cached relation_id
- * 
- * Same as CalicoLookupAndOptimisticPin but uses a pre-computed relation_id
- * to skip the expensive CalicoGetRelationIDInternal call. This is useful when
- * performing many lookups on the same relation (e.g., HNSW graph traversal).
- */
-BufferDesc *
-CalicoLookupAndOptimisticPinWithRid(SMgrRelation smgr,
-                                     ForkNumber forkNum,
-                                     BlockNumber blockNum,
-                                     bool *foundPtr,
-                                     uint64 *versionOut,
-                                     uint32 *frameIdOut,
-                                     void **entryPtrOut,
-                                     uint32 relation_id)
-{
-    return CalicoLookupAndOptimisticPinInternal(smgr, forkNum, blockNum,
-                                                 foundPtr, versionOut, frameIdOut,
-                                                 entryPtrOut, relation_id, true);
+                                                 entryPtrOut);
 }
 
 /*
@@ -1441,13 +1390,13 @@ CalicoLookupAndOptimisticValidate(void *entryPtr,
     if (entry_ptr == NULL)
         return false;
     
-    /*
-     * CRITICAL: Memory barrier to ensure all buffer content reads complete
-     * BEFORE we read the version for validation. Without this, the CPU could
-     * reorder the validation read before the buffer content reads, causing
-     * us to validate against a stale version while reading modified data.
-     */
-    pg_memory_barrier();
+    // /*
+    //  * CRITICAL: Memory barrier to ensure all buffer content reads complete
+    //  * BEFORE we read the version for validation. Without this, the CPU could
+    //  * reorder the validation read before the buffer content reads, causing
+    //  * us to validate against a stale version while reading modified data.
+    //  */
+    // pg_memory_barrier();
     
     /* Read current entry value */
     current_val = pg_atomic_read_u64(entry_ptr);
@@ -1481,7 +1430,6 @@ CalicoLookupAndOptimisticPinBatch(SMgrRelation smgr,
 {
     const RelFileLocator *rlocator = &smgr->smgr_rlocator.locator;
     uint32 relation_id;
-    uint64 p;
     SecondLevelTable second_level_table;
     int i;
     
@@ -1491,16 +1439,28 @@ CalicoLookupAndOptimisticPinBatch(SMgrRelation smgr,
         foundOut[i] = false;
     }
     
-    /* Get relation ID - this must exist for batch lookup to be useful */
-    relation_id = CalicoGetRelationIDInternal(rlocator->spcOid, rlocator->dbOid,
-                                               rlocator->relNumber, forkNum);
+    /* Try TLS cache first */
+    bool tls_hit = CalicoTLSCacheLookup(rlocator->spcOid, rlocator->dbOid,
+                                        rlocator->relNumber, forkNum,
+                                        &relation_id, &second_level_table);
     
-    /* Get second-level table */
-    p = pg_atomic_read_u64(&CalicoTopLevelTable[relation_id]);
-    if (p == 0)
-        return; /* No second level table, all lookups fail */
-    
-    second_level_table = (SecondLevelTable)(uintptr_t)p;
+    if (!tls_hit)
+    {
+        /* TLS cache miss - get relation ID and L2 table */
+        relation_id = CalicoGetRelationIDInternal(rlocator->spcOid, rlocator->dbOid,
+                                                   rlocator->relNumber, forkNum);
+        
+        /* Get second-level table */
+        uint64 p = pg_atomic_read_u64(&CalicoTopLevelTable[relation_id]);
+        if (p == 0)
+            return; /* No second level table, all lookups fail */
+        
+        second_level_table = (SecondLevelTable)(uintptr_t)p;
+        
+        /* Update TLS cache with the translation path */
+        CalicoTLSCacheUpdate(rlocator->spcOid, rlocator->dbOid, rlocator->relNumber, forkNum,
+                             relation_id, second_level_table);
+    }
     
     /* 
      * Main loop with 4-way unrolling for better ILP/MLP.
