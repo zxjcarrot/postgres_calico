@@ -633,9 +633,6 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 {
     const RelFileLocator *rlocator = &smgr->smgr_rlocator.locator;
 
-    ResourceOwnerEnlarge(CurrentResourceOwner);
-    ReservePrivateRefCountEntry();
-
     if (unlikely(blockNum >= MAX_BLOCKS_PER_REL)){
         *(int*)(NULL) = 1;
         memcpy(NULL, foundPtr, blockNum);
@@ -707,6 +704,9 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
     /* Now we have the L2 table (either from cache or freshly fetched) */
     CalicoTranslationEntry *entry_ptr = &second_level_table[blockNum];
 
+
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+	ReservePrivateRefCountEntry();
 
     /* Build the canonical BufferTag and choose the SAME mapping partition lock as hashtable */
     BufferTag tag;
